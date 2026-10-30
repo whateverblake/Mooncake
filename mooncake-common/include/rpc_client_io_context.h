@@ -16,6 +16,10 @@
 
 namespace mooncake {
 
+// Schedule a name on each executor so it is applied by its own I/O thread.
+void SetRpcIoThreadNames(coro_io::io_context_pool& pool,
+                        const std::string& name_prefix);
+
 std::shared_ptr<coro_io::io_context_pool> CreateRpcClientIoContextPool(
     uint32_t thread_count);
 

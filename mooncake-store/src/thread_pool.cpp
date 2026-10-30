@@ -1,10 +1,15 @@
 // ThreadPool.cpp
 #include "thread_pool.h"
+#include "thread_name.h"
 #include <stdexcept>
 namespace mooncake {
-ThreadPool::ThreadPool(size_t num_threads) : stop_flag(false) {
+ThreadPool::ThreadPool(size_t num_threads, std::string name_prefix)
+    : stop_flag(false) {
     for (size_t i = 0; i < num_threads; ++i) {
-        workers.emplace_back([this] {
+        workers.emplace_back([this, name_prefix, i] {
+            if (!name_prefix.empty()) {
+                SetCurrentThreadName(name_prefix + "-" + std::to_string(i));
+            }
             while (true) {
                 std::function<void()> task;
                 {

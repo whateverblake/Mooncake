@@ -1,4 +1,5 @@
 #include "client_metric.h"
+#include "thread_name.h"
 
 #include <glog/logging.h>
 #include <chrono>
@@ -177,6 +178,7 @@ void ClientMetric::StartMetricsReportingThread() {
     should_stop_metrics_thread_ = false;
     metrics_reporting_thread_ =
         std::jthread([this](const std::stop_token& stop_token) {
+            SetCurrentThreadName("mc-client-stats");
             LOG(INFO) << "Client metrics reporting thread started (interval: "
                       << metrics_interval_seconds_ << "s)";
 

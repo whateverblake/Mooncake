@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transport/tcp_transport/tcp_transport.h"
+#include "thread_name.h"
 
 #include <bits/stdint-uintn.h>
 #include <glog/logging.h>
@@ -361,7 +362,7 @@ int TcpTransport::install(std::string& local_server_name,
     metadata_ = meta;
     local_server_name_ = local_server_name;
     int sockfd = -1;
-    int tcp_port = findAvailableTcpPort(sockfd);
+    int tcp_port = findConfiguredTcpPort(sockfd, "MC_TCP_DATA_PORT");
     if (tcp_port == 0) {
         LOG(ERROR) << "TcpTransport: unable to find available tcp port for "
                       "data transmission";
@@ -637,6 +638,7 @@ void TcpTransport::startTransferSequence(std::vector<Slice*> slices) {
 }
 
 void TcpTransport::worker() {
+    SetCurrentThreadName("mc-tcp-io");
     while (running_) {
         try {
             context_->doAccept();

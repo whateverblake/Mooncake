@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "real_client.h"
+#include "thread_name.h"
 #include "registered_pinned_memory.h"
 #include "client_buffer.h"
 #include "replica_selection.h"
@@ -662,6 +663,7 @@ void ResourceTracker::startSignalThread() {
 
         signal_thread_ = std::jthread([set, ready = std::move(ready)](
                                           const std::stop_token &st) mutable {
+            SetCurrentThreadName("mc-signal");
             // Register a stop callback to interrupt sigwait via SIGUSR1
             pthread_t self = pthread_self();
             std::stop_callback cb(st,
@@ -1175,7 +1177,7 @@ int RealClient::setup_real(
     return to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine,
-        ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path,
+        ipc_socket_path, 50053, enable_ssd_offload, true, ssd_offload_path,
         tenant_id, enable_client_http_server, client_http_port));
 }
 
@@ -6480,6 +6482,7 @@ tl::expected<PingResponse, ErrorCode> RealClient::ping(const UUID &client_id) {
 }
 
 void RealClient::dummy_client_monitor_func() {
+    SetCurrentThreadName("mc-dummy-mon");
     std::unordered_map<UUID, std::chrono::steady_clock::time_point,
                        boost::hash<UUID>>
         client_ttl;

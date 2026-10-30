@@ -1,4 +1,5 @@
 #include "client_service.h"
+#include "thread_name.h"
 
 #include <boost/algorithm/string.hpp>
 #include <glog/logging.h>
@@ -418,8 +419,8 @@ Client::Client(const std::string& local_hostname,
       protocol_(protocol),
       object_checksum_enabled_(Environ::Get().GetStoreChecksumEnabled()),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
-      write_thread_pool_(2),
-      task_thread_pool_(4) {
+      write_thread_pool_(2, "mc-disk-write"),
+      task_thread_pool_(4, "mc-task-work") {
     LOG(INFO) << "client_id=" << client_id_;
     if (!host_id_.empty()) {
         LOG(INFO) << "client_id=" << client_id_ << ", host_id=" << host_id_;
@@ -718,6 +719,7 @@ ErrorCode Client::SwitchLeader(const ha::MasterView& target_view) {
 }
 
 void Client::LeaderMonitorThreadMain() {
+    SetCurrentThreadName("mc-leader-mon");
     // WaitForViewChange now blocks on a backend watch and returns as soon as
     // leadership actually changes, so this timeout no longer drives polling
     // cadence -- it is only a periodic re-sync safety net that re-reads the
@@ -4585,6 +4587,7 @@ void Client::PollAndDispatchTasks() {
 }
 
 void Client::TaskPollThreadMain() {
+    SetCurrentThreadName("mc-task-poll");
     const auto poll_interval = std::chrono::milliseconds(1000);
 
     while (task_poll_running_.load()) {
@@ -4722,6 +4725,7 @@ void Client::ExecuteTask(const ClientTask& client_task) {
 }
 
 void Client::StorageHeartbeatThreadMain() {
+    SetCurrentThreadName("mc-store-hb");
     // How many failed pings before reconnecting via the HA coordinator
     const int max_ping_fail_count = 3;
     // How long to wait for next ping after success
@@ -4732,6 +4736,7 @@ void Client::StorageHeartbeatThreadMain() {
     int ping_fail_count = 0;
 
     auto remount_segment = [this]() {
+        SetCurrentThreadName("mc-remount");
         // This lock must be held until the remount rpc is finished,
         // otherwise there will be corner cases, e.g., a segment is
         // unmounted successfully first, and then remounted again in

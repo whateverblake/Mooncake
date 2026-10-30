@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transfer_metadata.h"
+#include "thread_name.h"
 
 #include <json/value.h>
 
@@ -224,6 +225,7 @@ void TransferMetadata::startMetadataRefreshPollingIfNeeded() {
         config.te_metadata_refresh_interval_seconds;
     should_stop_metadata_refresh_thread_ = false;
     metadata_refresh_thread_ = std::thread([this, refresh_interval_seconds]() {
+        SetCurrentThreadName("mc-meta-refresh");
         metadataRefreshPollingLoop(refresh_interval_seconds);
     });
     LOG(INFO) << "TE metadata refresh polling enabled, interval_seconds="

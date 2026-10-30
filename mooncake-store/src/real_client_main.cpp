@@ -1,11 +1,14 @@
 #include <gflags/gflags.h>
 #include <csignal>
+#include <utility>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "client_service.h"
 #include "common.h"
 #include "config.h"
 #include "real_client.h"
+#include "rpc_client_io_context.h"
+#include "thread_name.h"
 
 using namespace mooncake;
 
@@ -109,6 +112,7 @@ int main(int argc, char *argv[]) {
     // Otherwise, the main thread will not apply signal mask before other
     // spawning threads, leading to missing signal processing.
     mooncake::ResourceTracker::getInstance();
+    SetCurrentThreadName("mc-client");
 
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     if (!FLAGS_log_dir.empty()) {
@@ -142,10 +146,16 @@ int main(int argc, char *argv[]) {
 
     auto rpc_bind_host = getHostNameWithoutPort(FLAGS_host);
     coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, rpc_bind_host);
+    SetRpcIoThreadNames(server.get_io_context_pool(), "mc-rpc-srv");
     RegisterClientRpcService(server, *client_inst);
 
     LOG(INFO) << "Starting real client service on " << rpc_bind_host << ":"
               << FLAGS_port;
 
-    return server.start();
+    // The pool manager inherits the spawning thread's name. Its I/O workers
+    // receive their own names through SetRpcIoThreadNames above.
+    SetCurrentThreadName("mc-rpc-srv-mgr");
+    auto server_result = server.async_start();
+    SetCurrentThreadName("mc-client");
+    return std::move(server_result).get();
 }

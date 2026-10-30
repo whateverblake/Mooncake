@@ -74,7 +74,15 @@ struct HandShakePlugin {
 
 std::vector<std::string> findLocalIpAddresses();
 
-uint16_t findAvailableTcpPort(int &sockfd, bool set_range = false);
+// Reserve a socket on preferred_port, or select automatically when it is zero.
+uint16_t findAvailableTcpPort(int &sockfd, bool set_range = false,
+                              uint16_t preferred_port = 0,
+                              uint16_t excluded_port = 0);
+
+// Unset environment variable: automatic selection. A configured value must be
+// a decimal port in [1, 65535]. Invalid or unavailable ports fail without fallback.
+uint16_t findConfiguredTcpPort(int &sockfd, const char *env_name,
+                               uint16_t excluded_port = 0);
 
 }  // namespace mooncake
 

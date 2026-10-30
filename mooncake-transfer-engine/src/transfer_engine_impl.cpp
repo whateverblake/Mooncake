@@ -139,7 +139,15 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
         if (metadata_conn_string == P2PHANDSHAKE) {
             rpc_binding_method = "P2P handshake";
-            desc.rpc_port = findAvailableTcpPort(desc.sockfd);
+            // Do not let automatic handshake selection take the port requested
+            // for the TCP payload listener, which is installed later.
+            uint16_t data_port = 0;
+            if (const char* value = std::getenv("MC_TCP_DATA_PORT")) {
+                data_port = parseFromString<uint16_t>(value).value_or(0);
+            }
+            desc.rpc_port =
+                findConfiguredTcpPort(desc.sockfd, "MC_TE_HANDSHAKE_PORT",
+                                      data_port);
             if (desc.rpc_port == 0) {
                 LOG(ERROR) << "P2P: No valid port found for local TCP service.";
                 return -1;

@@ -1,4 +1,5 @@
 #include "uds_transport.h"
+#include "thread_name.h"
 
 #include <glog/logging.h>
 
@@ -310,6 +311,7 @@ void UdsAcceptor::stop() {
 }
 
 void UdsAcceptor::acceptLoop() {
+    SetCurrentThreadName("mc-ipc-accept");
     while (running_.load()) {
         int client_sock = accept(listen_fd_, nullptr, nullptr);
         if (client_sock < 0) {

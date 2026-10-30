@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <ylt/util/tl/expected.hpp>
 #include <boost/algorithm/string.hpp>
 
@@ -181,7 +182,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
                       << ", error=" << toString(result.error());
               }
           }),
-      replica_cleanup_worker_([this] { ClearInvalidHandles(); }),
+      replica_cleanup_worker_([this] { ClearInvalidHandles(); },
+                              "mc-repl-clean"),
       enable_async_segment_cleanup_(
           !config.enable_ha && !config.enable_snapshot && !config.enable_cxl),
       default_kv_lease_ttl_(config.default_kv_lease_ttl),
@@ -2593,6 +2595,7 @@ void MasterService::ClearStaleHandles(
 }
 
 void MasterService::TaskCleanupThreadFunc() {
+    pthread_setname_np(pthread_self(), "mc-task-clean");
     LOG(INFO) << "Task cleanup thread started";
     while (task_cleanup_running_) {
         // Wait for the next cleanup interval, but allow fast shutdown.
@@ -8108,6 +8111,7 @@ void MasterService::TrySubmitDynamicReplicaProposal(
 }
 
 void MasterService::DynamicReplicationAdmissionThreadFunc() {
+    pthread_setname_np(pthread_self(), "mc-dyn-repl");
     VLOG(1) << "action=dynamic_replication_admission_thread_started";
     while (dynamic_replication_admission_running_) {
         std::vector<ObjectIdentity> batch;
@@ -9051,6 +9055,7 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
 }
 
 void MasterService::EvictionThreadFunc() {
+    pthread_setname_np(pthread_self(), "mc-eviction");
     VLOG(1) << "action=eviction_thread_started";
 
     auto last_discard_time = std::chrono::system_clock::now();
@@ -11015,6 +11020,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
 }
 
 void MasterService::ClientMonitorFunc() {
+    pthread_setname_np(pthread_self(), "mc-client-mon");
     std::unordered_map<UUID, std::chrono::steady_clock::time_point,
                        boost::hash<UUID>>
         client_ttl;
@@ -12691,6 +12697,7 @@ void MasterService::ProcessDrainJobs() {
 }
 
 void MasterService::JobDispatchThreadFunc() {
+    pthread_setname_np(pthread_self(), "mc-job-dispatch");
     while (job_dispatch_running_) {
         ProcessDrainJobs();
         std::this_thread::sleep_for(

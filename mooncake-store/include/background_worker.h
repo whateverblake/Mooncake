@@ -1,8 +1,11 @@
 #pragma once
 
+#include <pthread.h>
+
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -16,8 +19,9 @@ class BackgroundWorker {
    public:
     using Callback = std::function<void()>;
 
-    explicit BackgroundWorker(Callback callback)
-        : callback_(std::move(callback)) {}
+    // Linux thread names may contain at most 15 bytes (excluding the null).
+    explicit BackgroundWorker(Callback callback, std::string thread_name = "")
+        : callback_(std::move(callback)), thread_name_(std::move(thread_name)) {}
 
     ~BackgroundWorker() { Stop(); }
 
@@ -62,6 +66,9 @@ class BackgroundWorker {
 
    private:
     void ThreadFunc() {
+        if (!thread_name_.empty()) {
+            pthread_setname_np(pthread_self(), thread_name_.c_str());
+        }
         while (true) {
             {
                 std::unique_lock<std::mutex> lock(mutex_);
@@ -76,6 +83,7 @@ class BackgroundWorker {
     }
 
     Callback callback_;
+    std::string thread_name_;
     std::mutex mutex_;
     std::condition_variable cv_;
     std::thread thread_;

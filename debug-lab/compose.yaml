@@ -1,0 +1,25 @@
+name: mooncake-debug-lab
+services:
+  lab:
+    container_name: mooncake-debug
+    image: mooncake-debug:arm64
+    platform: linux/arm64
+    build:
+      context: .
+    init: true
+    ports:
+      - "127.0.0.1:33333:22"
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+    mem_limit: 8g
+    shm_size: 256m
+    volumes:
+      - ..:/workspace/mooncake
+      - build:/workspace/build
+      - ./.local/id_ed25519.pub:/run/lab-key.pub:ro
+      - ./.local/root_password:/run/lab-root-password:ro
+    working_dir: /workspace/mooncake
+volumes:
+  build:

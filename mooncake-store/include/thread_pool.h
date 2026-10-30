@@ -8,6 +8,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <string>
 namespace mooncake {
 /**
  * @class ThreadPool
@@ -19,7 +20,7 @@ namespace mooncake {
 class ThreadPool {
    public:
     /// Constructs a thread pool with specified number of worker threads
-    explicit ThreadPool(size_t num_threads);
+    explicit ThreadPool(size_t num_threads, std::string name_prefix = "");
 
     /// Destructor (stops all threads and completes pending tasks)
     ~ThreadPool();

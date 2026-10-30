@@ -277,3 +277,8 @@ if(WITH_P2P_STORE)
   add_subdirectory(mooncake-p2p-store)
   message(STATUS "P2P Store will be built")
 endif()
+
+option(BUILD_DEBUG_LAB "Build the local TCP source-debugging demo" OFF)
+if(BUILD_DEBUG_LAB)
+  add_subdirectory(debug-lab)
+endif()

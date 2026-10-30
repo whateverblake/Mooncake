@@ -1,0 +1,6 @@
+if(NOT WITH_STORE OR NOT WITH_TE OR NOT USE_TCP OR USE_TENT)
+  message(FATAL_ERROR "The debug lab requires WITH_STORE, WITH_TE, USE_TCP, and USE_TENT=OFF")
+endif()
+add_executable(store_debug_demo store_debug_demo.cpp)
+target_link_libraries(store_debug_demo PRIVATE mooncake_store)
+target_compile_options(store_debug_demo PRIVATE -O0 -g3 -fno-omit-frame-pointer)

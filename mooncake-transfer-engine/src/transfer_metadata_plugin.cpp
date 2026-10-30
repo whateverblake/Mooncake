@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transfer_metadata_plugin.h"
+#include "thread_name.h"
 
 #include <arpa/inet.h>
 #include <bits/stdint-uintn.h>
@@ -24,7 +25,10 @@
 #include <poll.h>
 #include <sys/socket.h>
 
+#include <charconv>
+#include <cstdlib>
 #include <random>
+#include <string_view>
 
 #ifdef USE_REDIS
 #include <hiredis/hiredis.h>
@@ -728,6 +732,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
         listener_running_ = true;
         listener_ = std::thread([this]() {
+            mooncake::SetCurrentThreadName("mc-handshake");
             while (listener_running_) {
                 sockaddr_in addr;
                 socklen_t addr_len = sizeof(sockaddr_in);
@@ -1306,7 +1311,35 @@ std::vector<std::string> findLocalIpAddresses() {
     return ips;
 }
 
-uint16_t findAvailableTcpPort(int &sockfd, bool set_range) {
+uint16_t findConfiguredTcpPort(int &sockfd, const char *env_name,
+                               uint16_t excluded_port) {
+    sockfd = -1;
+    const char *value = std::getenv(env_name);
+    if (!value) return findAvailableTcpPort(sockfd, false, 0, excluded_port);
+
+    std::string_view text(value);
+    unsigned int port = 0;
+    const auto [end, error] =
+        std::from_chars(text.data(), text.data() + text.size(), port);
+    if (error != std::errc{} || end != text.data() + text.size() ||
+        port == 0 || port > 65535) {
+        LOG(ERROR) << env_name << " must be a decimal TCP port in [1, 65535], "
+                   << "got '" << text << "'";
+        return 0;
+    }
+
+    const auto bound_port =
+        findAvailableTcpPort(sockfd, false, static_cast<uint16_t>(port));
+    if (!bound_port) {
+        LOG(ERROR) << "Cannot reserve " << env_name << "=" << port
+                   << "; no automatic port fallback";
+    }
+    return bound_port;
+}
+
+uint16_t findAvailableTcpPort(int &sockfd, bool set_range,
+                              uint16_t preferred_port, uint16_t excluded_port) {
+    sockfd = -1;
     static std::random_device rand_gen;
     std::uniform_int_distribution rand_dist;
     int min_port = globalConfig().rpc_min_port;
@@ -1331,14 +1364,30 @@ uint16_t findAvailableTcpPort(int &sockfd, bool set_range) {
         }
     }
 #endif
-    const int max_attempts = 500;
+    const int max_attempts = preferred_port ? 1 : 500;
     bool use_ipv6 = globalConfig().use_ipv6;
 
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
-        int port = min_port + rand_dist(rand_gen) % (max_port - min_port + 1);
+        int port = preferred_port
+                       ? preferred_port
+                       : min_port + rand_dist(rand_gen) %
+                                        (max_port - min_port + 1);
+        if (!preferred_port && port == excluded_port) continue;
         sockfd = socket(use_ipv6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
         if (sockfd == -1) {
+            if (preferred_port) PLOG(ERROR) << "Cannot create TCP socket";
             continue;
+        }
+
+        // Fixed listeners must be restartable after connections enter TIME_WAIT.
+        if (preferred_port) {
+            int on = 1;
+            if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
+                PLOG(ERROR) << "Cannot enable TCP address reuse";
+                close(sockfd);
+                sockfd = -1;
+                return 0;
+            }
         }
 
         struct timeval timeout;
@@ -1346,6 +1395,7 @@ uint16_t findAvailableTcpPort(int &sockfd, bool set_range) {
         timeout.tv_usec = 0;
         if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                        sizeof(timeout))) {
+            if (preferred_port) PLOG(ERROR) << "Cannot set TCP socket timeout";
             close(sockfd);
             sockfd = -1;
             continue;
@@ -1359,6 +1409,8 @@ uint16_t findAvailableTcpPort(int &sockfd, bool set_range) {
             bind_address.sin6_addr = IN6ADDR_ANY_INIT;
             if (bind(sockfd, (sockaddr *)&bind_address, sizeof(sockaddr_in6)) <
                 0) {
+                if (preferred_port)
+                    PLOG(ERROR) << "Cannot bind configured TCP port " << port;
                 close(sockfd);
                 sockfd = -1;
                 continue;
@@ -1371,12 +1423,22 @@ uint16_t findAvailableTcpPort(int &sockfd, bool set_range) {
             bind_address.sin_addr.s_addr = INADDR_ANY;
             if (bind(sockfd, (sockaddr *)&bind_address, sizeof(sockaddr_in)) <
                 0) {
+                if (preferred_port)
+                    PLOG(ERROR) << "Cannot bind configured TCP port " << port;
                 close(sockfd);
                 sockfd = -1;
                 continue;
             }
         }
 
+        // With SO_REUSEADDR, bind alone does not exclude another reserving
+        // socket. Listen now to reserve this fixed endpoint exclusively.
+        if (preferred_port && listen(sockfd, SOMAXCONN) < 0) {
+            PLOG(ERROR) << "Cannot listen on configured TCP port " << port;
+            close(sockfd);
+            sockfd = -1;
+            return 0;
+        }
         return port;
     }
     return 0;

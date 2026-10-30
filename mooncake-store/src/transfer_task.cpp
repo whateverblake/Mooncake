@@ -1,4 +1,5 @@
 #include "transfer_task.h"
+#include "thread_name.h"
 
 #include <glog/logging.h>
 
@@ -195,7 +196,10 @@ FilereadWorkerPool::FilereadWorkerPool(std::shared_ptr<StorageBackend>& backend)
     // Start worker threads
     workers_.reserve(num_workers);
     for (int i = 0; i < num_workers; ++i) {
-        workers_.emplace_back(&FilereadWorkerPool::workerThread, this);
+        workers_.emplace_back([this, i] {
+            SetCurrentThreadName("mc-file-read-" + std::to_string(i));
+            workerThread();
+        });
     }
     backend_ = backend;
 }
@@ -407,6 +411,7 @@ static inline bool CheckSubTaskPool(
 }
 
 void SpdkNofWorkerPool::workerThread(int work_idx) {
+    SetCurrentThreadName("mc-nof-io-" + std::to_string(work_idx));
     bindToSocket(numa_socket_id_);
     VLOG(2) << "SpdkNofWorkerPool worker thread started";
 
@@ -635,6 +640,7 @@ void MemcpyWorkerPool::submitTask(MemcpyTask task) {
 }
 
 void MemcpyWorkerPool::workerThread() {
+    SetCurrentThreadName("mc-memcpy");
     VLOG(2) << "MemcpyWorkerPool worker thread started";
 
     while (true) {
@@ -827,7 +833,7 @@ void TransferEngineOperationState::wait_for_completion() {
     }
 
     // 60 seconds
-    constexpr int64_t timeout_milliseconds = 60 * 1000;
+    constexpr int64_t timeout_milliseconds = 60 * 1000000;
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
     VLOG(1) << "Waiting for transfer engine completion for batch " << batch_id_;
