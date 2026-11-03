@@ -131,29 +131,30 @@ if(BUILD_UBSMEM_TESTS)
   if(NOT USE_UBSMEM)
     message(FATAL_ERROR "BUILD_UBSMEM_TESTS requires USE_UBSMEM")
   endif()
-  if(NOT UBSMEM_BACKEND STREQUAL "mock")
-    message(FATAL_ERROR "The focused UBS tests require UBSMEM_BACKEND=mock")
+  # These tests use the mock's session files and locks directly. The Store
+  # tests in mooncake-store also run with the SDK backend.
+  if(UBSMEM_BACKEND STREQUAL "mock")
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_executable(ubsmem_memory_test tests/ubsmem_memory_test.cpp)
+    target_link_libraries(ubsmem_memory_test PRIVATE ubsmem_memory)
+    add_test(NAME ubsmem_memory COMMAND ubsmem_memory_test)
+    add_executable(ubsmem_transport_test tests/ubsmem_transport_test.cpp)
+    target_link_libraries(ubsmem_transport_test PRIVATE transfer_engine
+                                                        ubsmem_memory)
+    add_test(NAME ubsmem_transport COMMAND ubsmem_transport_test)
+    if(USE_TCP AND NOT USE_EVENT_DRIVEN_COMPLETION)
+      add_test(NAME ubsmem_tcp_regression COMMAND ubsmem_transport_test tcp)
+      set_tests_properties(ubsmem_tcp_regression PROPERTIES TIMEOUT 30)
+    endif()
+    if(USE_HTTP)
+      add_test(
+        NAME ubsmem_metadata
+        COMMAND
+          ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_ubsmem_metadata.py
+          $<TARGET_FILE:ubsmem_transport_test>)
+      set_tests_properties(ubsmem_metadata PROPERTIES TIMEOUT 60)
+    endif()
+    set_tests_properties(ubsmem_memory ubsmem_transport PROPERTIES TIMEOUT 30)
   endif()
-  find_package(Python3 REQUIRED COMPONENTS Interpreter)
-  add_executable(ubsmem_memory_test tests/ubsmem_memory_test.cpp)
-  target_link_libraries(ubsmem_memory_test PRIVATE ubsmem_memory)
-  add_test(NAME ubsmem_memory COMMAND ubsmem_memory_test)
-  add_executable(ubsmem_transport_test tests/ubsmem_transport_test.cpp)
-  target_link_libraries(ubsmem_transport_test PRIVATE transfer_engine
-                                                      ubsmem_memory)
-  add_test(NAME ubsmem_transport COMMAND ubsmem_transport_test)
-  if(USE_TCP AND NOT USE_EVENT_DRIVEN_COMPLETION)
-    add_test(NAME ubsmem_tcp_regression COMMAND ubsmem_transport_test tcp)
-    set_tests_properties(ubsmem_tcp_regression PROPERTIES TIMEOUT 30)
-  endif()
-  if(USE_HTTP)
-    add_test(
-      NAME ubsmem_metadata
-      COMMAND
-        ${Python3_EXECUTABLE}
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_ubsmem_metadata.py
-        $<TARGET_FILE:ubsmem_transport_test>)
-    set_tests_properties(ubsmem_metadata PROPERTIES TIMEOUT 60)
-  endif()
-  set_tests_properties(ubsmem_memory ubsmem_transport PROPERTIES TIMEOUT 30)
 endif()

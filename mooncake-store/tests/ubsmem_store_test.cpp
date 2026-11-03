@@ -226,8 +226,11 @@ int main(int argc, char** argv) {
         }
         const size_t pool_size =
             tcp ? facebook::cachelib::Slab::kSize : 4 * 1024 * 1024;
+        // Set this to the node's address when roles run on different hosts.
+        const char* host = std::getenv("MC_UBSMEM_TEST_HOST");
         auto client = mooncake::RealClient::create();
-        require(client->setup_real("127.0.0.1", "P2PHANDSHAKE",
+        require(client->setup_real(host && *host ? host : "127.0.0.1",
+                                   "P2PHANDSHAKE",
                                    provider ? pool_size : 0, 4 * 1024 * 1024,
                                    tcp ? "tcp" : "ubsmem", "", argv[2]) == 0,
                 "setup_real ubsmem");

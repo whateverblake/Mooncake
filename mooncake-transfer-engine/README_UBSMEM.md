@@ -373,7 +373,10 @@ still need hardware testing. [Three-process test](../mooncake-store/tests/ubsmem
 An optional `UBSMEM_BACKEND=sdk` adapter uses the `ubs-mem` 1.1.0 API baseline
 at commit `26e900125b47ff835b443622288e3f0124e752f6`. Configure
 `UBSMEM_INCLUDE_DIR` and `UBSMEM_LIBRARY` for `ubs_mem.h` and `libubsm_sdk`.
-Disable `BUILD_UBSMEM_TESTS`; those tests intentionally require the mock.
+With `BUILD_UBSMEM_TESTS=ON`, the SDK build includes the Store tests:
+allocator, ownership fault, three-process Put/Get, TCP regression and master
+policy. The Transfer Engine tests use the mock's files and locks directly, so
+they are built only with the mock backend.
 
 The adapter allocates with exactly `UBSM_FLAG_WITH_LOCK`, maps with
 `MAP_SHARED`, and uses the SDK read/write locks and unlock operation. The
@@ -392,3 +395,65 @@ The SDK API does not offer cancellation of an in-progress lock call. A local
 timeout cannot safely free memory still used by that call. On ownership
 release failure or a reported UB fault, stop using the affected session and
 retain its allocation until the hardware services establish safe revocation.
+
+### Test on a UB host
+
+The SDK build has been compiled and linked in the container against a stub
+library that fails every call. It has not run against a real UBS Memory
+service. Run these commands on the UB host. The UBS Memory service must be
+running, and all processes must use the same Linux user.
+
+```sh
+git clone -b codex/ubsmem-transport https://github.com/whateverblake/Mooncake.git
+cd Mooncake
+git submodule update --init --recursive
+sudo bash dependencies.sh
+find / \( -name ubs_mem.h -o -name 'libubsm_sdk*' \) 2>/dev/null
+```
+
+Configure with the paths printed by `find`:
+
+```sh
+cmake -S . -B build-ubsmem -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+  -DWITH_TE=ON -DWITH_STORE=ON -DUSE_TCP=ON -DUSE_TENT=OFF -DUSE_CUDA=OFF \
+  -DUSE_ETCD=OFF -DUSE_HTTP=ON -DUSE_REDIS=OFF -DSTORE_USE_ETCD=OFF \
+  -DWITH_STORE_RUST=OFF -DWITH_STORE_GO=OFF -DWITH_P2P_STORE=OFF \
+  -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF \
+  -DUSE_UBSMEM=ON -DUBSMEM_BACKEND=sdk -DBUILD_UBSMEM_TESTS=ON \
+  -DUBSMEM_INCLUDE_DIR=/path/to/include \
+  -DUBSMEM_LIBRARY=/path/to/libubsm_sdk.so
+cmake --build build-ubsmem --target mooncake_master ubsmem_store_test \
+  ubsmem_allocator_test ubsmem_ownership_test -j
+```
+
+Set the SDK variables for this qualification run only, then run the tests.
+The runner starts the master, B, A and C on this host.
+
+```sh
+export MC_UBSMEM_SDK_QUALIFIED=1
+export MC_UBSMEM_DOMAIN=<configured sharing domain>
+export MC_UBSMEM_REGION=default   # or: export MC_UBSMEM_PROVIDER=<host name>
+ctest --test-dir build-ubsmem -R '^ubsmem_' --output-on-failure
+```
+
+To place the roles on two UB nodes, start the master on node 1 with
+`--rpc_address=<node1 IP>` and the other flags shown above. Give each node its
+own empty session directory. Set `MC_UBSMEM_TEST_HOST` to the node's own IP,
+and keep the SDK variables from the previous step.
+
+```sh
+# Node 1: provider B
+mkdir -p /tmp/ubs-b
+MC_UBSMEM_TEST_HOST=<node1 IP> MC_TE_HANDSHAKE_PORT=16002 \
+  build-ubsmem/mooncake-store/ubsmem_store_test provider <node1 IP>:50151 /tmp/ubs-b
+# Node 2, after /tmp/ubs-b/ready exists on node 1: producer A, then consumer C
+mkdir -p /tmp/ubs-ac
+MC_UBSMEM_TEST_HOST=<node2 IP> MC_TE_HANDSHAKE_PORT=16004 \
+  build-ubsmem/mooncake-store/ubsmem_store_test producer <node1 IP>:50151 /tmp/ubs-ac
+MC_UBSMEM_TEST_HOST=<node2 IP> MC_TE_HANDSHAKE_PORT=16006 \
+  build-ubsmem/mooncake-store/ubsmem_store_test consumer <node1 IP>:50151 /tmp/ubs-ac
+# Node 1, after A and C print UBSMEM_STORE_OK
+touch /tmp/ubs-b/stop
+```
+
+Both nodes must reach the master port and each other's handshake ports.
