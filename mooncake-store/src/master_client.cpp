@@ -23,6 +23,15 @@ template <auto Method>
 struct RpcNameTraits;
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BeginUbsMemoryTransfer> {
+    static constexpr const char* value = "BeginUbsMemoryTransfer";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::EndUbsMemoryTransfer> {
+    static constexpr const char* value = "EndUbsMemoryTransfer";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::ExistKey> {
     static constexpr const char* value = "ExistKey";
 };
@@ -537,6 +546,33 @@ MasterClient::GetReplicaListByRegex(const std::string& str) {
 
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<uint64_t, ErrorCode> MasterClient::BeginUbsMemoryTransfer(
+    const AllocatedBuffer::Descriptor& descriptor) {
+    uint64_t operation = next_ubsmem_operation_.load();
+    do {
+        if (operation == UINT64_MAX) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    } while (!next_ubsmem_operation_.compare_exchange_weak(operation,
+                                                           operation + 1));
+    auto result =
+        invoke_rpc<&WrappedMasterService::BeginUbsMemoryTransfer, void>(
+            client_id_, operation, descriptor);
+    if (!result) {
+        // Close even an uncertain begin: a delayed RPC must not reopen it.
+        auto ended = EndUbsMemoryTransfer(operation);
+        if (!ended) LOG(ERROR) << "UBS reference cleanup is uncertain";
+        return tl::unexpected(result.error());
+    }
+    return operation;
+}
+
+tl::expected<void, ErrorCode> MasterClient::EndUbsMemoryTransfer(
+    uint64_t operation) {
+    return invoke_rpc<&WrappedMasterService::EndUbsMemoryTransfer, void>(
+        client_id_, operation);
 }
 
 tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(

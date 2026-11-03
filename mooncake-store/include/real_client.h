@@ -29,6 +29,10 @@
 #include <ylt/coro_io/coro_io.hpp>
 #include <async_simple/coro/Lazy.h>
 
+#ifdef USE_UBSMEM
+#include "transport/ubsmem_transport/ubsmem_memory.h"
+#endif
+
 namespace mooncake {
 
 class RealClient;
@@ -924,6 +928,9 @@ class RealClient : public PyClient {
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
+#ifdef USE_UBSMEM
+    std::vector<std::shared_ptr<UbsMemoryArena>> ubsmem_arenas_;
+#endif
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
     std::vector<std::unique_ptr<void, UbSegmentDeleter>> ub_segment_ptrs_;

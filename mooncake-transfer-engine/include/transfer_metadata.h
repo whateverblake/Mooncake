@@ -36,6 +36,10 @@
 #include "common.h"
 #include "topology.h"
 
+#ifdef USE_UBSMEM
+#include "transport/ubsmem_transport/ubsmem_descriptor.h"
+#endif
+
 namespace mooncake {
 struct MetadataStoragePlugin;
 struct HandShakePlugin;
@@ -54,6 +58,9 @@ class TransferMetadata {
     };
 
     struct BufferDesc {
+#ifdef USE_UBSMEM
+        UbsMemoryDescriptor ubsmem;
+#endif
         std::string name;
         uint64_t addr;
         uint64_t length;

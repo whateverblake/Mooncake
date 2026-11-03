@@ -53,7 +53,8 @@ class AllocatedBuffer {
           offset_handle_(std::move(offset_handle)) {}
 
     AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
-                    const Descriptor& descriptor);
+                    const Descriptor& descriptor,
+                    std::shared_ptr<void> lifetime = nullptr);
 
     ~AllocatedBuffer();
 
@@ -85,8 +86,9 @@ class AllocatedBuffer {
         uintptr_t buffer_address_;
         std::string protocol_;
         std::string transport_endpoint_;
+        uint64_t ubsmem_allocation_id_ = 0;
         YLT_REFL(Descriptor, size_, buffer_address_, protocol_,
-                 transport_endpoint_);
+                 transport_endpoint_, ubsmem_allocation_id_);
     };
 
     void change_to_cxl(std::string client_segment_name);
@@ -98,6 +100,8 @@ class AllocatedBuffer {
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
     std::string protocol{"tcp"};
+    uint64_t ubsmem_allocation_id_ = 0;
+    std::shared_ptr<void> lifetime_;
     // RAII handle for buffer allocated by offset allocator
     std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
         std::nullopt};

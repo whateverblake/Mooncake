@@ -568,6 +568,32 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
+#ifdef USE_UBSMEM
+    } else if (desc.protocol == "ubsmem") {
+        Json::Value buffers(Json::arrayValue);
+        for (const auto &buffer : desc.buffers) {
+            const auto &u = buffer.ubsmem;
+            if (!u.valid() || !buffer.addr || !buffer.length ||
+                buffer.length > u.object_size - u.object_offset ||
+                buffer.length > UINT64_MAX - buffer.addr) {
+                return ERR_METADATA;
+            }
+            Json::Value item;
+            item["name"] = buffer.name;
+            item["addr"] = Json::UInt64(buffer.addr);
+            item["length"] = Json::UInt64(buffer.length);
+            item["version"] = u.version;
+            item["backend"] = u.backend;
+            item["domain"] = u.domain;
+            item["host"] = u.host;
+            item["object_name"] = u.object_name;
+            item["generation"] = u.generation;
+            item["object_size"] = Json::UInt64(u.object_size);
+            item["object_offset"] = Json::UInt64(u.object_offset);
+            buffers.append(item);
+        }
+        segmentJSON["buffers"] = buffers;
+#endif
     } else if (segmentJSON["protocol"] == "cxl") {
         segmentJSON["cxl_name"] = desc.cxl_name;
         segmentJSON["cxl_base_addr"] =
@@ -978,6 +1004,46 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             }
             desc->buffers.push_back(buffer);
         }
+#ifdef USE_UBSMEM
+    } else if (desc->protocol == "ubsmem") {
+        const auto &buffers = segmentJSON["buffers"];
+        if (!buffers.isArray()) return nullptr;
+        for (const auto &item : buffers) {
+            if (!item.isObject()) return nullptr;
+            for (const char *field : {"name", "backend", "domain", "host",
+                                      "object_name", "generation"}) {
+                if (!item[field].isString()) return nullptr;
+            }
+            for (const char *field :
+                 {"addr", "length", "object_size", "object_offset"}) {
+                if (!item[field].isUInt64()) return nullptr;
+            }
+            if (!item["version"].isUInt() || item["version"].asUInt() != 1) {
+                return nullptr;
+            }
+            BufferDesc buffer{};
+            buffer.name = item["name"].asString();
+            buffer.addr = item["addr"].asUInt64();
+            buffer.length = item["length"].asUInt64();
+            auto &u = buffer.ubsmem;
+            u.backend = item["backend"].asString();
+            u.domain = item["domain"].asString();
+            u.host = item["host"].asString();
+            u.object_name = item["object_name"].asString();
+            u.generation = item["generation"].asString();
+            u.object_size = item["object_size"].asUInt64();
+            u.object_offset = item["object_offset"].asUInt64();
+            if (!u.valid() || buffer.name.empty() || !buffer.addr ||
+                !buffer.length || buffer.length > UINT64_MAX - buffer.addr ||
+                buffer.length > u.object_size - u.object_offset) {
+                return nullptr;
+            }
+#ifdef ENABLE_MULTI_PROTOCOL
+            buffer.protocol = "ubsmem";
+#endif
+            desc->buffers.push_back(std::move(buffer));
+        }
+#endif
     } else if (desc->protocol == "nvmeof") {
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             NVMeoFBufferDesc buffer;

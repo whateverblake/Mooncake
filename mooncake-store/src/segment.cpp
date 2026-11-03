@@ -1,5 +1,7 @@
 #include "segment.h"
 
+#include "ubsmem_allocator.h"
+
 #include "ha/snapshot/local_ssd_codec.h"
 #include "master_metric_manager.h"
 #include "utils/zstd_util.h"
@@ -210,7 +212,8 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    if (segment_manager_->memory_allocator_ == BufferAllocatorType::CACHELIB &&
+    if (segment.protocol != "ubsmem" &&
+        segment_manager_->memory_allocator_ == BufferAllocatorType::CACHELIB &&
         (buffer % facebook::cachelib::Slab::kSize ||
          size % facebook::cachelib::Slab::kSize)) {
         LOG(ERROR) << "buffer=" << buffer << " or size=" << size
@@ -241,22 +244,27 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     // invalid for the slab allocator.
     try {
         // Create allocator based on the configured type
-        switch (segment_manager_->memory_allocator_) {
-            case BufferAllocatorType::CACHELIB:
-                allocator = std::make_shared<CachelibBufferAllocator>(
-                    segment.name, buffer, size, segment.te_endpoint);
-                break;
-            case BufferAllocatorType::OFFSET:
-                allocator = std::make_shared<OffsetBufferAllocator>(
-                    segment.name, buffer, size, segment.te_endpoint);
-                break;
-            default:
-                LOG(ERROR) << "segment_name=" << segment.name
-                           << ", error=unknown_memory_allocator="
-                           << static_cast<int>(
-                                  segment_manager_->memory_allocator_);
-                return ErrorCode::INVALID_PARAMS;
-        }
+        if (segment.protocol == "ubsmem") {
+            allocator = std::make_shared<UbsMemoryBufferAllocator>(
+                segment.name, buffer, size, segment.te_endpoint,
+                segment_manager_->ubsmem_registry_);
+        } else
+            switch (segment_manager_->memory_allocator_) {
+                case BufferAllocatorType::CACHELIB:
+                    allocator = std::make_shared<CachelibBufferAllocator>(
+                        segment.name, buffer, size, segment.te_endpoint);
+                    break;
+                case BufferAllocatorType::OFFSET:
+                    allocator = std::make_shared<OffsetBufferAllocator>(
+                        segment.name, buffer, size, segment.te_endpoint);
+                    break;
+                default:
+                    LOG(ERROR) << "segment_name=" << segment.name
+                               << ", error=unknown_memory_allocator="
+                               << static_cast<int>(
+                                      segment_manager_->memory_allocator_);
+                    return ErrorCode::INVALID_PARAMS;
+            }
 
         if (!allocator) {
             LOG(ERROR) << "segment_name=" << segment.name

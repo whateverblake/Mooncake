@@ -874,8 +874,32 @@ MasterService::DeleteTenantQuotaPolicy(const TenantId& tenant_id) {
     return GetTenantQuotaSnapshot(tenant_id);
 }
 
+tl::expected<void, ErrorCode> MasterService::BeginUbsMemoryTransfer(
+    const UUID& client_id, uint64_t operation,
+    const AllocatedBuffer::Descriptor& descriptor) {
+    if (!ubsmem_transfers_.begin(client_id, operation, descriptor)) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> MasterService::EndUbsMemoryTransfer(
+    const UUID& client_id, uint64_t operation) {
+    ubsmem_transfers_.end(client_id, operation);
+    return {};
+}
+
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    if (segment.protocol == "ubsmem" &&
+        (eviction_ratio_ != 0.0 || eviction_high_watermark_ratio_ != 1.0 ||
+         enable_ha_ || snapshot_object_store_ || enable_offload_ ||
+         offload_on_evict_ || enable_dfs_ || !root_fs_dir_.empty())) {
+        LOG(ERROR) << "UBS pools require eviction_ratio=0, "
+                      "eviction_high_watermark_ratio=1, and no HA, "
+                      "snapshot recovery or storage tiering";
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
     ErrorCode mount_result = ErrorCode::OK;
     {
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -987,6 +1011,11 @@ ErrorCode MasterService::ValidateStandbyRemountSegment(
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    for (const auto& segment : segments) {
+        if (segment.protocol == "ubsmem") {
+            return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+        }
+    }
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
         std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);

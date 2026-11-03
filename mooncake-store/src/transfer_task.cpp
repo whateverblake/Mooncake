@@ -1,5 +1,6 @@
 #include "transfer_task.h"
 #include "thread_name.h"
+#include "master_client.h"
 
 #include <glog/logging.h>
 
@@ -739,6 +740,20 @@ void MemcpyWorkerPool::workerThread() {
 // TransferEngineOperationState Implementation
 // ============================================================================
 
+TransferEngineOperationState::~TransferEngineOperationState() {
+    if (on_complete_) wait_for_completion();
+    const auto released = engine_.freeBatchID(batch_id_);
+    if (on_complete_) {
+        // UBS freeBatchID succeeds only after every worker has stopped using
+        // the batch. Unknown completion must retain the master's reference.
+        if (released.ok()) {
+            on_complete_();
+        } else {
+            LOG(ERROR) << "UBS transfer reference retained: completion unknown";
+        }
+    }
+}
+
 bool TransferEngineOperationState::is_completed() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (result_.has_value()) {
@@ -809,6 +824,10 @@ void TransferEngineOperationState::check_task_status() {
         ec = ErrorCode::TRANSFER_FAIL;
     }
 
+    if (on_complete_) {
+        auto release = std::move(on_complete_);
+        release();
+    }
     set_result_internal(ec);
 }
 
@@ -878,7 +897,13 @@ void TransferEngineOperationState::wait_for_completion() {
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        set_result_internal(error_code);
+        if (completed && on_complete_) {
+            // An event also fires on ownership faults. Query the transport
+            // before releasing references; terminal CPU work is not enough.
+            check_task_status();
+        } else {
+            set_result_internal(error_code);
+        }
     }
 
     if (completed) {
@@ -990,6 +1015,15 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
         }
     }
 
+#ifdef USE_UBSMEM
+    auto metadata = engine_.getMetadata();
+    auto segment =
+        metadata ? metadata->getSegmentDescByID(LOCAL_SEGMENT_ID) : nullptr;
+    if (segment && segment->protocol == "ubsmem") {
+        memcpy_enabled_ = false;
+    }
+#endif
+
     VLOG(1) << "TransferSubmitter initialized with memcpy_enabled="
             << memcpy_enabled_;
 }
@@ -1063,6 +1097,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     bool use_local_memcpy =
         op_code == TransferRequest::WRITE && !replicas.empty();
     size_t operation_count = 0;
+    std::vector<AllocatedBuffer::Descriptor> ubs_handles;
     for (size_t i = 0; i < replicas.size(); ++i) {
         if (!replicas[i].is_memory_replica()) {
             LOG(ERROR) << "Batch transfer only supports memory replicas";
@@ -1073,8 +1108,12 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
         if (!validateTransferParams(handle, all_slices[i])) {
             return std::nullopt;
         }
-        use_local_memcpy =
-            use_local_memcpy && canUseLocalMemcpy(handle.transport_endpoint_);
+        if (handle.protocol_ == "ubsmem") {
+            ubs_handles.push_back(handle);
+            use_local_memcpy = false;
+        } else if (use_local_memcpy) {
+            use_local_memcpy = canUseLocalMemcpy(handle.transport_endpoint_);
+        }
         operation_count += all_slices[i].size();
     }
 
@@ -1111,9 +1150,15 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             offset += slice.size;
         }
     }
+    std::function<void()> on_complete;
+    if (!ubs_handles.empty()) {
+        auto release = pinUbsMemory(ubs_handles);
+        if (!release) return std::nullopt;
+        on_complete = std::move(*release);
+    }
     auto future = use_local_memcpy
                       ? submitMemcpyOperations(std::move(memcpy_operations))
-                      : submitTransfer(requests);
+                      : submitTransfer(requests, std::move(on_complete));
     // Update metrics on successful submission
     if (future.has_value()) {
         for (auto& slices : all_slices) {
@@ -1243,11 +1288,12 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests) {
+    std::vector<TransferRequest>& requests, std::function<void()> on_complete) {
     // Allocate batch ID
     const size_t batch_size = requests.size();
     BatchID batch_id = engine_.allocateBatchID(batch_size);
     if (batch_id == INVALID_BATCH_ID) {
+        if (on_complete) on_complete();
         LOG(ERROR) << "Failed to allocate batch ID";
         return std::nullopt;
     }
@@ -1260,7 +1306,9 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
         // Note: batch_id will be freed by TransferEngineOperationState
         // destructor if we create the state object, otherwise we need to free
         // it here
-        engine_.freeBatchID(batch_id);
+        if (engine_.freeBatchID(batch_id).ok() && on_complete) {
+            on_complete();
+        }
         return std::nullopt;
     }
 
@@ -1272,9 +1320,36 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     // Create state with transfer engine context - no polling thread
     // needed
     auto state = std::make_shared<TransferEngineOperationState>(
-        engine_, batch_id, batch_size);
+        engine_, batch_id, batch_size, std::move(on_complete));
 
     return TransferFuture(state);
+}
+
+std::optional<std::function<void()>> TransferSubmitter::pinUbsMemory(
+    const std::vector<AllocatedBuffer::Descriptor>& handles) {
+    std::vector<uint64_t> operations;
+    operations.reserve(handles.size());
+    auto release = [master = ubsmem_master_](const auto& ids) {
+        for (auto id : ids) {
+            if (!master->EndUbsMemoryTransfer(id)) {
+                LOG(ERROR) << "UBS reference release was not acknowledged";
+            }
+        }
+    };
+    for (const auto& handle : handles) {
+        if (!ubsmem_master_ || !handle.ubsmem_allocation_id_) {
+            release(operations);
+            return std::nullopt;
+        }
+        auto operation = ubsmem_master_->BeginUbsMemoryTransfer(handle);
+        if (!operation) {
+            release(operations);
+            return std::nullopt;
+        }
+        operations.push_back(*operation);
+    }
+    return
+        [release, operations = std::move(operations)] { release(operations); };
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
@@ -1291,6 +1366,19 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         LOG(ERROR) << "Failed to open segment for endpoint='"
                    << handle.transport_endpoint_ << "'";
         return std::nullopt;
+    }
+
+    if (handle.protocol_ == "ubsmem") {
+        if (!ubsmem_master_ || !handle.ubsmem_allocation_id_ ||
+            src_offset > handle.size_)
+            return std::nullopt;
+        uint64_t remaining = handle.size_ - src_offset;
+        for (const auto& slice : slices) {
+            if (slice.size > remaining || (slice.size && !slice.ptr)) {
+                return std::nullopt;
+            }
+            remaining -= slice.size;
+        }
     }
 
     // Create transfer requests
@@ -1312,6 +1400,11 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
 
         offset += slice.size;
         requests.emplace_back(request);
+    }
+    if (handle.protocol_ == "ubsmem") {
+        auto release = pinUbsMemory({handle});
+        if (!release) return std::nullopt;
+        return submitTransfer(requests, std::move(*release));
     }
     return submitTransfer(requests);
 }
@@ -1486,7 +1579,8 @@ std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
 TransferStrategy TransferSubmitter::selectStrategy(
     const AllocatedBuffer::Descriptor& handle,
     const std::vector<Slice>& /* slices */) const {
-    return canUseLocalMemcpy(handle.transport_endpoint_)
+    return handle.protocol_ != "ubsmem" &&
+                   canUseLocalMemcpy(handle.transport_endpoint_)
                ? TransferStrategy::LOCAL_MEMCPY
                : TransferStrategy::TRANSFER_ENGINE;
 }
@@ -1513,6 +1607,9 @@ bool TransferSubmitter::validateTransferParams(
     const std::vector<Slice>& slices) const {
     uint64_t all_slice_len = 0;
     for (auto slice : slices) {
+        if (slice.size > handle.size_ - all_slice_len ||
+            (slice.size && !slice.ptr))
+            return false;
         all_slice_len += slice.size;
     }
     if (handle.size_ != all_slice_len) {

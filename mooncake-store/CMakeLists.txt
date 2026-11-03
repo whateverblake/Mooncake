@@ -73,3 +73,49 @@ endif()
 if (BUILD_BENCHMARK)
     add_subdirectory(benchmarks)
 endif()
+
+if(BUILD_UBSMEM_TESTS)
+  add_executable(ubsmem_store_test tests/ubsmem_store_test.cpp)
+  target_link_libraries(ubsmem_store_test PRIVATE mooncake_store)
+  add_executable(ubsmem_allocator_test tests/ubsmem_allocator_test.cpp)
+  target_link_libraries(ubsmem_allocator_test PRIVATE mooncake_store
+                                                      cachelib_memory_allocator)
+  add_test(NAME ubsmem_allocator COMMAND ubsmem_allocator_test)
+  add_executable(ubsmem_ownership_test tests/ubsmem_ownership_test.cpp)
+  target_link_libraries(ubsmem_ownership_test PRIVATE mooncake_store)
+
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(
+    NAME ubsmem_store_ownership_failure
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_ubsmem_store.py
+      $<TARGET_FILE:mooncake_master> $<TARGET_FILE:ubsmem_ownership_test>
+      --ownership-failure)
+  set_tests_properties(ubsmem_store_ownership_failure PROPERTIES TIMEOUT 60)
+
+  add_test(
+    NAME ubsmem_store_three_process
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_ubsmem_store.py
+      $<TARGET_FILE:mooncake_master> $<TARGET_FILE:ubsmem_store_test>)
+  set_tests_properties(ubsmem_store_three_process PROPERTIES TIMEOUT 120)
+  if(USE_TCP)
+    add_test(
+      NAME ubsmem_store_tcp_regression
+      COMMAND
+        ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_ubsmem_store.py
+        $<TARGET_FILE:mooncake_master> $<TARGET_FILE:ubsmem_store_test> --tcp)
+    set_tests_properties(ubsmem_store_tcp_regression PROPERTIES TIMEOUT 120)
+  endif()
+  add_test(
+    NAME ubsmem_store_master_policy
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_ubsmem_store.py
+      $<TARGET_FILE:mooncake_master> $<TARGET_FILE:ubsmem_store_test>
+      --reject-policy)
+  set_tests_properties(ubsmem_store_master_policy PROPERTIES TIMEOUT 60)
+endif()

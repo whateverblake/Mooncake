@@ -763,6 +763,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port) {
+    if (protocol == "ubsmem" &&
+        (enable_ssd_offload || !ipc_socket_path.empty() || use_hugepage_)) {
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -796,13 +800,27 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Check if hostname already contains a port
-    const std::string &hostname = local_hostname;
-    bool user_specified_port = hasExplicitPort(hostname);
+    std::string hostname = local_hostname;
+    const char *handshake_port = std::getenv("MC_TE_HANDSHAKE_PORT");
+#ifdef USE_TENT
+    if (std::getenv("MC_USE_TENT") || std::getenv("MC_USE_TEV1")) {
+        handshake_port = nullptr;  // Only the classic engine binds this port.
+    }
+#endif
+    if (handshake_port && metadata_server == P2PHANDSHAKE &&
+        protocol != "rpc_only" && !transfer_engine &&
+        !hasExplicitPort(hostname)) {
+        auto port = parseFromString<uint16_t>(handshake_port);
+        if (!port || *port == 0) {
+            LOG(ERROR) << "Invalid MC_TE_HANDSHAKE_PORT: " << handshake_port;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        hostname =
+            buildHostNameWithPort(getHostNameWithoutPort(hostname), *port);
+    }
 
-    if (user_specified_port) {
-        // User specified port, no retry needed
-        this->local_hostname = local_hostname;
+    if (hasExplicitPort(hostname)) {
+        this->local_hostname = hostname;
         this->local_rpc_addr = buildHostNameWithPort(
             getHostNameWithoutPort(hostname), local_rpc_port);
         auto client_opt = mooncake::Client::Create(
@@ -908,7 +926,24 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // If global_segment_size is 0, skip mount segment. Transports with a
     // registration limit split it into balanced chunks; other transports use
     // one segment.
-    if (protocol == "cxl") {
+    if (protocol == "ubsmem") {
+#ifdef USE_UBSMEM
+        if (global_segment_size > 0) {
+            try {
+                auto arena = UbsMemoryArena::create(global_segment_size);
+                ubsmem_arenas_.push_back(arena);
+                auto mounted = client_->MountSegment(arena->base(),
+                                                     arena->size(), protocol);
+                if (!mounted) return tl::unexpected(mounted.error());
+            } catch (const std::exception &error) {
+                LOG(ERROR) << "UBS arena allocation failed: " << error.what();
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
+#else
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+#endif
+    } else if (protocol == "cxl") {
         size_t cxl_dev_size = 0;
         const char *env = std::getenv("MC_CXL_DEV_SIZE");
         if (env) {
@@ -1393,6 +1428,16 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     hugepage_segment_ptrs_.clear();
     segment_ptrs_.clear();
     ub_segment_ptrs_.clear();
+#ifdef USE_UBSMEM
+    for (auto &arena : ubsmem_arenas_) {
+        if (!arena->remove()) {
+            LOG(WARNING) << "Retaining UBS pool "
+                         << arena->descriptor().object_name
+                         << ": another mapping or uncertain operation remains";
+        }
+    }
+    ubsmem_arenas_.clear();
+#endif
 #ifdef USE_VRAM_SEGMENT
     vram_segment_ptrs_.clear();
 #endif
@@ -1434,6 +1479,9 @@ int RealClient::mountSegment(const std::string &path, size_t offset,
                              size_t size, const std::string &protocol,
                              const std::string &location,
                              std::vector<std::string> &out_segment_ids) {
+    if (this->protocol == "ubsmem") {
+        return static_cast<int>(ErrorCode::NOT_SUPPORTED);
+    }
     if (!client_) {
         LOG(ERROR) << "Client not initialized";
         return -1;
@@ -1600,6 +1648,9 @@ void RealClient::ReleaseAllAllocatedSegmentRecords() {
 
 int RealClient::unmountSegment(const std::vector<std::string> &segment_ids,
                                uint64_t grace_period_seconds) {
+    if (this->protocol == "ubsmem") {
+        return static_cast<int>(ErrorCode::NOT_SUPPORTED);
+    }
     if (!client_) {
         LOG(ERROR) << "Client not initialized";
         return -1;
@@ -1677,6 +1728,9 @@ int RealClient::unmountSegment(const std::vector<std::string> &segment_ids,
 int RealClient::allocateAndMountSegment(
     size_t size, const std::string &protocol, const std::string &location,
     std::vector<std::string> &out_segment_ids, size_t *out_allocated_size) {
+    if (this->protocol == "ubsmem") {
+        return static_cast<int>(ErrorCode::NOT_SUPPORTED);
+    }
     if (!client_) {
         LOG(ERROR) << "Client not initialized";
         return -1;
@@ -5615,6 +5669,10 @@ int RealClient::batch_get_session_end(const std::vector<std::string> &keys) {
 std::vector<int> RealClient::batch_put_session_start(
     const std::vector<std::string> &keys, const std::vector<size_t> &sizes,
     const ReplicateConfig &config) {
+    if (protocol == "ubsmem") {
+        return std::vector<int>(keys.size(),
+                                static_cast<int>(ErrorCode::NOT_SUPPORTED));
+    }
     std::vector<int> results(keys.size(), 0);
     if (!client_ || keys.size() != sizes.size()) {
         LOG(ERROR) << "Invalid batch_put_session_start args";

@@ -211,6 +211,25 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 
+    if (auto_discover_config_.protocol == "ubsmem") {
+        if (getenv("MC_FORCE_TCP")) {
+            LOG(ERROR) << "Cannot select ubsmem with MC_FORCE_TCP set";
+            return -1;
+        }
+        try {
+            if (!multi_transports_->installTransport("ubsmem",
+                                                     local_topology_)) {
+                LOG(ERROR) << "Failed to install ubsmem transport";
+                return -1;
+            }
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to install ubsmem transport: " << e.what();
+            return -1;
+        }
+        LOG(INFO) << "Installed ubsmem transport";
+        return 0;
+    }
+
     // Universal TCP force mechanism: if MC_FORCE_TCP is set, skip all other
     // transport installation logic and use TCP transport only. This allows
     // running metadata-only instances without requiring specialized hardware

@@ -16,6 +16,18 @@
 #include "version.h"
 
 namespace mooncake {
+tl::expected<void, ErrorCode> WrappedMasterService::BeginUbsMemoryTransfer(
+    const UUID& client_id, uint64_t operation,
+    const AllocatedBuffer::Descriptor& descriptor) {
+    return master_service_.BeginUbsMemoryTransfer(client_id, operation,
+                                                  descriptor);
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::EndUbsMemoryTransfer(
+    const UUID& client_id, uint64_t operation) {
+    return master_service_.EndUbsMemoryTransfer(client_id, operation);
+}
+
 namespace {
 
 tl::expected<TenantId, ErrorCode> ResolveRequestTenantId(std::string_view raw) {
@@ -1740,6 +1752,10 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::GetReplicaListByRegex>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::BeginUbsMemoryTransfer>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::EndUbsMemoryTransfer>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
         &wrapped_master_service);

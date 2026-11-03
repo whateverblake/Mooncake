@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <csignal>
 #include <memory>
 #include <string>
@@ -80,6 +81,10 @@ inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig() {
  */
 class MasterClient {
    public:
+    tl::expected<uint64_t, ErrorCode> BeginUbsMemoryTransfer(
+        const AllocatedBuffer::Descriptor& descriptor);
+    tl::expected<void, ErrorCode> EndUbsMemoryTransfer(uint64_t operation);
+
     MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr,
                  std::string tenant_id = "default")
         : client_accessor_(GetStoreRpcClientIoContextPool(),
@@ -670,6 +675,8 @@ class MasterClient {
                           ReplicaType replica_type);
 
    private:
+    std::atomic<uint64_t> next_ubsmem_operation_{1};
+
     /**
      * @brief Generic RPC invocation helper for single-result operations
      * @tparam ServiceMethod Pointer to WrappedMasterService member function

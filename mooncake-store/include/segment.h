@@ -14,6 +14,7 @@
 
 #include "allocation_strategy.h"
 #include "allocator.h"
+#include "ubsmem_allocator.h"
 #include "local_ssd/persisted_state.h"
 #include "rpc_types.h"
 #include "storage_usage.h"
@@ -394,6 +395,10 @@ class SegmentManager {
      * @brief Constructor for SegmentManager
      * @param memory_allocator Type of buffer allocator to use for new segments
      */
+    std::shared_ptr<UbsMemoryAllocationRegistry> ubsMemoryRegistry() const {
+        return ubsmem_registry_;
+    }
+
     explicit SegmentManager(
         BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB,
         bool enable_cxl = false)
@@ -471,6 +476,8 @@ class SegmentManager {
     // Used for unified allocation and recycling of CXL shared memory.
     const bool enable_cxl_;
     std::shared_ptr<BufferAllocatorBase> cxl_global_allocator_;
+    std::shared_ptr<UbsMemoryAllocationRegistry> ubsmem_registry_ =
+        std::make_shared<UbsMemoryAllocationRegistry>();
     // allocator_manager_ only contains allocators whose segment status is OK.
     AllocatorManager allocator_manager_;
     std::unordered_map<UUID, MountedSegment, boost::hash<UUID>>

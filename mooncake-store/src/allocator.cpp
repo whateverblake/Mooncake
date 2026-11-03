@@ -54,11 +54,14 @@ AllocatedBuffer::~AllocatedBuffer() {
 }
 
 AllocatedBuffer::AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
-                                 const AllocatedBuffer::Descriptor& descriptor)
+                                 const AllocatedBuffer::Descriptor& descriptor,
+                                 std::shared_ptr<void> lifetime)
     : allocator_(std::move(allocator)),
       buffer_ptr_(reinterpret_cast<void*>(descriptor.buffer_address_)),
       size_(descriptor.size_),
-      protocol(descriptor.protocol_) {
+      protocol(descriptor.protocol_),
+      ubsmem_allocation_id_(descriptor.ubsmem_allocation_id_),
+      lifetime_(std::move(lifetime)) {
     if (protocol == "cxl") {
         segment_name_ = descriptor.transport_endpoint_;
     }
@@ -79,7 +82,8 @@ AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
     }
 
     return {static_cast<uint64_t>(size()),
-            reinterpret_cast<uintptr_t>(buffer_ptr_), this->protocol, endpoint};
+            reinterpret_cast<uintptr_t>(buffer_ptr_), this->protocol, endpoint,
+            ubsmem_allocation_id_};
 }
 
 void AllocatedBuffer::change_to_cxl(std::string client_segment_name) {

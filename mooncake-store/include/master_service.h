@@ -165,6 +165,12 @@ class MasterService {
     friend class test::MasterServiceHATest;
 
    public:
+    tl::expected<void, ErrorCode> BeginUbsMemoryTransfer(
+        const UUID& client_id, uint64_t operation,
+        const AllocatedBuffer::Descriptor& descriptor);
+    tl::expected<void, ErrorCode> EndUbsMemoryTransfer(const UUID& client_id,
+                                                       uint64_t operation);
+
     using NoFProbeFn =
         std::function<bool(const std::string&, uint32_t, std::string*)>;
     using DurableFinalizeCallback =
@@ -2679,6 +2685,8 @@ class MasterService {
 
     // Segment management
     SegmentManager segment_manager_;
+    UbsMemoryTransferRegistry ubsmem_transfers_{
+        segment_manager_.ubsMemoryRegistry()};
     LocalSsdManager local_ssd_manager_;
     NoFSegmentManager nof_segment_manager_;
     BufferAllocatorType memory_allocator_type_;

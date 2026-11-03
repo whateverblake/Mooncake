@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -25,6 +26,8 @@
 #endif
 
 namespace mooncake {
+
+class MasterClient;
 
 /**
  * @brief Transfer strategy enumeration
@@ -217,13 +220,15 @@ class FilereadOperationState : public OperationState {
 class TransferEngineOperationState : public OperationState {
    public:
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
-                                 size_t batch_size)
+                                 size_t batch_size,
+                                 std::function<void()> on_complete = {})
         : engine_(engine),
           batch_id_(batch_id),
           batch_size_(batch_size),
-          start_ts_(getCurrentTimeInMilli()) {}
+          start_ts_(getCurrentTimeInMilli()),
+          on_complete_(std::move(on_complete)) {}
 
-    ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
+    ~TransferEngineOperationState();
 
     bool is_completed() override;
 
@@ -247,6 +252,7 @@ class TransferEngineOperationState : public OperationState {
     BatchID batch_id_;
     size_t batch_size_;
     const int64_t start_ts_;
+    std::function<void()> on_complete_;
 };
 
 /**
@@ -533,6 +539,8 @@ class FilereadWorkerPool {
  */
 class TransferSubmitter {
    public:
+    void setUbsMemoryMaster(MasterClient* master) { ubsmem_master_ = master; }
+
     explicit TransferSubmitter(TransferEngine& engine,
                                std::shared_ptr<StorageBackend>& backend,
                                const std::string& local_hostname,
@@ -600,6 +608,8 @@ class TransferSubmitter {
                                       const std::string& local_endpoint);
 
    private:
+    MasterClient* ubsmem_master_ = nullptr;
+
     TransferEngine& engine_;
     // Cached at construction: the local transport endpoint never changes for
     // the lifetime of the TransferSubmitter, so we avoid calling
@@ -656,6 +666,9 @@ class TransferSubmitter {
      * @brief Submit transfer engine operation asynchronously
      * @param src_offset Optional offset in source buffer (default 0)
      */
+    std::optional<std::function<void()>> pinUbsMemory(
+        const std::vector<AllocatedBuffer::Descriptor>& handles);
+
     std::optional<TransferFuture> submitTransferEngineOperation(
         const AllocatedBuffer::Descriptor& handle,
         const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
@@ -680,7 +693,8 @@ class TransferSubmitter {
                                TransferRequest::OpCode op);
 
     std::optional<TransferFuture> submitTransfer(
-        std::vector<TransferRequest>& requests);
+        std::vector<TransferRequest>& requests,
+        std::function<void()> on_complete = {});
 };
 
 }  // namespace mooncake

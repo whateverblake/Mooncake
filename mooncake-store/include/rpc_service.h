@@ -21,6 +21,12 @@ namespace mooncake {
 class HttpMetadataServer;
 class WrappedMasterService {
    public:
+    tl::expected<void, ErrorCode> BeginUbsMemoryTransfer(
+        const UUID& client_id, uint64_t operation,
+        const AllocatedBuffer::Descriptor& descriptor);
+    tl::expected<void, ErrorCode> EndUbsMemoryTransfer(const UUID& client_id,
+                                                       uint64_t operation);
+
     // Constructor with optional metadata-cleanup-on-timeout configuration.
     // - http_metadata_server: in-process pointer used when the HTTP metadata
     //   server is co-located in the master process (nullptr = not co-located).

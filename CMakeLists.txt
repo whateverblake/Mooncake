@@ -12,7 +12,7 @@ include(mooncake-common/FindJsonCpp.cmake)
 include(mooncake-common/FindGLOG.cmake)
 include(mooncake-common/common.cmake)
 # unit test
-if(BUILD_UNIT_TESTS)
+if(BUILD_UNIT_TESTS OR BUILD_UBSMEM_TESTS)
   enable_testing()
 endif()
 
@@ -28,6 +28,9 @@ option(
   "build a self-contained libmooncake_store.so exposing only the store_c.h C ABI (for dlopen consumers)"
   OFF)
 option(WITH_EP "build mooncake with expert parallelism support" OFF)
+if(USE_UBSMEM AND NOT WITH_TE)
+  message(FATAL_ERROR "USE_UBSMEM requires WITH_TE=ON")
+endif()
 option(USE_NOF "build mooncake store with NoF SSD pool support" OFF)
 option(MOONCAKE_ENABLE_TEST_FAILPOINTS
        "Enable file-handshake failpoints for integration tests" OFF)

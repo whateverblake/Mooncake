@@ -1,5 +1,9 @@
 file(GLOB XPORT_SOURCES "*.cpp")
 
+if(USE_UBSMEM)
+  add_subdirectory(ubsmem_transport)
+endif()
+
 add_subdirectory(rdma_transport)
 add_subdirectory(rdma_twosided)
 add_subdirectory(rpc_communicator)

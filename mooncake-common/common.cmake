@@ -97,6 +97,15 @@ option(USE_ASCEND_HETEROGENEOUS
        "option for transferring between ascend npu and gpu" OFF)
 option(USE_MNNVL "option for using Multi-Node NVLink transport" OFF)
 option(USE_CXL "option for using CXL protocol" OFF)
+option(USE_UBSMEM "Build experimental CPU UBS Memory transport" OFF)
+option(BUILD_UBSMEM_TESTS "Build focused UBS Memory tests" OFF)
+set(UBSMEM_BACKEND
+    "mock"
+    CACHE STRING "UBS Memory backend: mock or sdk")
+set_property(CACHE UBSMEM_BACKEND PROPERTY STRINGS mock sdk)
+if(USE_UBSMEM)
+  add_compile_definitions(USE_UBSMEM)
+endif()
 option(USE_EFA "option for using AWS EFA transport" OFF)
 option(USE_UB "option for using UB protocol transport" OFF)
 option(USE_SUNRISE

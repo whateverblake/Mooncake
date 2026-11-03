@@ -42,6 +42,9 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
+#ifdef USE_UBSMEM
+#include "transport/ubsmem_transport/ubsmem_memory.h"
+#endif
 #include "device/accelerator_registry.h"
 #ifdef USE_INTRA_NVLINK
 #include "gpu_vendor/intra_nvlink.h"
@@ -495,8 +498,18 @@ Client::~Client() {
 
     // Unmount mounted segments: notify master + local cleanup
     for (auto& segment : mounted_segments_copy) {
-        auto result =
-            UnmountSegment(reinterpret_cast<void*>(segment.base), segment.size);
+        tl::expected<void, ErrorCode> result;
+        if (protocol_ == "ubsmem") {
+            // UBS pools cannot be unmounted through the public live API.
+            // Shutdown has stopped local producers and owns this cleanup.
+            std::lock_guard lock(mounted_segments_mutex_);
+            auto it = mounted_segments_.find(segment.id);
+            if (it == mounted_segments_.end()) continue;
+            result = UnmountSegmentImpl(it);
+        } else {
+            result = UnmountSegment(reinterpret_cast<void*>(segment.base),
+                                    segment.size);
+        }
         if (!result) {
             LOG(ERROR) << "Failed to unmount segment in destructor: "
                        << toString(result.error());
@@ -795,6 +808,10 @@ ErrorCode Client::InitTransferEngine(
     // if Mooncake was built without USE_TENT, the env var has no effect on
     // the TransferEngine, so the store must still install transports.
     bool use_tent = transfer_engine_->isUsingTent();
+    if (protocol == "ubsmem" && use_tent) {
+        LOG(ERROR) << "ubsmem requires the classic Transfer Engine";
+        return ErrorCode::INVALID_PARAMS;
+    }
 
     bool auto_discover = false;
     if (!use_tent) {
@@ -854,6 +871,14 @@ ErrorCode Client::InitTransferEngine(
     if (rc != 0) {
         LOG(ERROR) << "Failed to initialize transfer engine, rc=" << rc;
         return ErrorCode::INTERNAL_ERROR;
+    }
+
+    if (protocol == "ubsmem") {
+        if (device_names.has_value()) {
+            LOG(WARNING)
+                << "ubsmem protocol does not use device names, ignoring";
+        }
+        return ErrorCode::OK;  // The engine installed ubsmem during init.
     }
 
     // TENT mode: Skip manual transport installation - TENT handles this
@@ -1022,6 +1047,9 @@ void Client::InitTransferSubmitter() {
         *transfer_engine_, storage_backend_, local_hostname_,
         metrics_ ? &metrics_->transfer_metric : nullptr);
 #endif
+    if (protocol_ == "ubsmem") {
+        transfer_submitter_->setUbsMemoryMaster(&master_client_);
+    }
 }
 
 std::optional<std::shared_ptr<Client>> Client::Create(
@@ -1032,6 +1060,11 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     std::map<std::string, std::string> labels, const std::string& tenant_id) {
     auto client = std::shared_ptr<Client>(new Client(
         local_hostname, metadata_connstring, protocol, labels, tenant_id));
+    if (protocol == "ubsmem" &&
+        (transfer_engine || client->GetLocalHotCacheSizeFromEnv() != 0)) {
+        LOG(ERROR) << "ubsmem does not support shared engines or hot cache";
+        return std::nullopt;
+    }
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
@@ -1105,6 +1138,11 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                 return std::nullopt;
             }
         }
+    }
+
+    if (protocol == "ubsmem" && client->storage_backend_) {
+        LOG(ERROR) << "ubsmem does not support a disk storage backend";
+        return std::nullopt;
     }
 
     // this only performs RPC calls
@@ -1463,6 +1501,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 
 std::optional<TransferEngine::ScatterTransferOperation> Client::SubmitScatter(
     const std::vector<TransferEngine::ScatterTransferRange>& transfers) {
+    if (protocol_ == "ubsmem") return std::nullopt;
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         return std::nullopt;
@@ -1855,6 +1894,11 @@ bool Client::RedirectToHotCache(const std::string& key,
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
+    if (protocol_ == "ubsmem" &&
+        (config.replica_num != 1 || config.nof_replica_num != 0 ||
+         config.dfs_replica_num != 0)) {
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -1998,6 +2042,9 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                              std::vector<Slice>& slices,
                                              const ReplicateConfig& config) {
+    if (protocol_ == "ubsmem") {
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -2149,6 +2196,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
+    if (protocol_ == "ubsmem") {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::NOT_SUPPORTED));
+    }
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3242,6 +3293,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
+    if (protocol_ == "ubsmem" &&
+        (config.replica_num != 1 || config.nof_replica_num != 0 ||
+         config.dfs_replica_num != 0)) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::NOT_SUPPORTED));
+    }
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3279,6 +3336,11 @@ std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
 Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
                               const std::vector<uint64_t>& object_sizes,
                               const ReplicateConfig& config) {
+    if (protocol_ == "ubsmem") {
+        return std::vector<
+            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::NOT_SUPPORTED));
+    }
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
         results(keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     if (keys.size() != object_sizes.size()) {
@@ -3473,6 +3535,9 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
 
 tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
                                                      size_t size) {
+    if (protocol_ == "ubsmem") {
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
     std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
     auto segment = mounted_segments_.end();
 
@@ -3495,6 +3560,20 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
 tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
     const void* buffer, size_t size, const std::string& protocol,
     const std::string& location) {
+    if (protocol_ == "ubsmem" || protocol == "ubsmem") {
+        if (protocol_ != protocol) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+#ifdef USE_UBSMEM
+        auto arena = UbsMemoryArena::findOwned(const_cast<void*>(buffer), size);
+        if (!arena || arena->base() != buffer || arena->size() != size ||
+            !arena->claimStorePool()) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+#else
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+#endif
+    }
     auto check_result = CheckRegisterMemoryParams(buffer, size, protocol);
     if (!check_result) {
         return tl::unexpected(check_result.error());
@@ -3559,6 +3638,9 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
 tl::expected<void, ErrorCode> Client::UnmountSegmentById(
     const UUID& segment_id, uint64_t grace_period_ms,
     std::function<void(const UUID&)> cleanup_callback) {
+    if (protocol_ == "ubsmem") {
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
     std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
     auto segment = mounted_segments_.find(segment_id);
     if (segment == mounted_segments_.end()) {
@@ -3886,24 +3968,40 @@ ErrorCode Client::PromotionWrite(const Replica::Descriptor& memory_descriptor,
 
 tl::expected<UUID, ErrorCode> Client::CreateCopyTask(
     const std::string& key, const std::vector<std::string>& targets) {
+    if (protocol_ == "ubsmem") {
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
     return master_client_.CreateCopyTask(key, targets);
 }
 
 tl::expected<UUID, ErrorCode> Client::CreateCopyTask(
     const std::string& key, const std::string& tenant_id,
     const std::vector<std::string>& targets) {
+    if (protocol_ == "ubsmem") {
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
     return master_client_.CreateCopyTask(key, tenant_id, targets);
 }
 
 tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
     const std::string& key, const std::string& source,
     const std::string& target) {
+    if (protocol_ == "ubsmem") {
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
     return master_client_.CreateMoveTask(key, source, target);
 }
 
 tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
     const std::string& key, const std::string& tenant_id,
     const std::string& source, const std::string& target) {
+    if (protocol_ == "ubsmem") {
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
     return master_client_.CreateMoveTask(key, tenant_id, source, target);
 }
 
@@ -3913,6 +4011,10 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
     std::function<tl::expected<void, ErrorCode>()> revoke_fn,
     const Replica::Descriptor& source,
     const std::vector<Replica::Descriptor>& targets) {
+    if (protocol_ == "ubsmem") {
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
     auto revoke_lambda = [&]() {
         auto revoke_result = revoke_fn();
         if (!revoke_result.has_value()) {
@@ -3967,12 +4069,20 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
 tl::expected<void, ErrorCode> Client::Copy(
     const std::string& key, const std::string& source,
     const std::vector<std::string>& targets) {
+    if (protocol_ == "ubsmem") {
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
     return Copy(key, master_client_.tenant_id(), source, targets);
 }
 
 tl::expected<void, ErrorCode> Client::Copy(
     const std::string& key, const std::string& tenant_id,
     const std::string& source, const std::vector<std::string>& targets) {
+    if (protocol_ == "ubsmem") {
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
     return Copy(key, tenant_id, source, targets, UUID{}, 0);
 }
 
@@ -3981,6 +4091,10 @@ tl::expected<void, ErrorCode> Client::Copy(
     const std::string& source, const std::vector<std::string>& targets,
     const UUID& dynamic_replication_lease_id,
     uint64_t dynamic_replication_version_epoch) {
+    if (protocol_ == "ubsmem") {
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
     LOG(INFO) << "action=replica_copy_start" << ", key=" << key
               << ", targets_count=" << targets.size();
 
@@ -4054,6 +4168,10 @@ tl::expected<void, ErrorCode> Client::Copy(
 tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& source,
                                            const std::string& target) {
+    if (protocol_ == "ubsmem") {
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
     return Move(key, master_client_.tenant_id(), source, target);
 }
 
@@ -4061,6 +4179,10 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& tenant_id,
                                            const std::string& source,
                                            const std::string& target) {
+    if (protocol_ == "ubsmem") {
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
     LOG(INFO) << "action=replica_move_start" << ", key=" << key
               << ", source_segment=" << source << ", target_segment=" << target;
 
@@ -4746,6 +4868,11 @@ void Client::StorageHeartbeatThreadMain() {
         for (auto it : mounted_segments_) {
             auto& segment = it.second;
             segments.emplace_back(segment);
+        }
+        if (protocol_ == "ubsmem") {
+            LOG(ERROR) << "UBS session lost its master; restart the session "
+                          "with a new pool after draining all clients";
+            return;
         }
         auto remount_result = master_client_.ReMountSegment(segments);
         if (!remount_result) {

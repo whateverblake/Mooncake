@@ -82,6 +82,11 @@
 #endif
 
 #include <cassert>
+#include <string_view>
+
+#ifdef USE_UBSMEM
+#include "transport/ubsmem_transport/ubsmem_transport.h"
+#endif
 
 namespace mooncake {
 MultiTransport::MultiTransport(std::shared_ptr<TransferMetadata> metadata,
@@ -109,6 +114,22 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     for (size_t task_id = 0; task_id < task_count; task_id++) {
+#ifdef USE_UBSMEM
+        auto* transport = batch_desc.task_list[task_id].transport_;
+        if (transport && std::string_view(transport->getName()) == "ubsmem") {
+            // Event-only waiters can observe is_finished before the notifier
+            // returns. Join UBS completion publication before deleting its CV.
+            TransferStatus status;
+            auto result =
+                transport->getTransferStatus(batch_id, task_id, status);
+            if (!result.ok()) return result;
+            if (status.s != Transport::COMPLETED &&
+                status.s != Transport::FAILED) {
+                return Status::BatchBusy("UBS transfers are still active");
+            }
+            continue;
+        }
+#endif
         if (!batch_desc.task_list[task_id].is_finished) {
             return Status::BatchBusy(
                 "BatchID cannot be freed until all tasks are done");
@@ -366,7 +387,18 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     const size_t task_count = batch_desc.task_list.size();
     status.transferred_bytes = 0;
 
-    if (batch_desc.is_finished.load(std::memory_order_acquire) ||
+    bool use_cached_status = true;
+#ifdef USE_UBSMEM
+    if (task_count && batch_desc.task_list.front().transport_) {
+        use_cached_status =
+            std::string_view(
+                batch_desc.task_list.front().transport_->getName()) != "ubsmem";
+    }
+#endif
+    // UBS event publication records task outcomes before the aggregate byte
+    // cache is populated. Poll its guarded tasks for both failure and bytes.
+    if ((use_cached_status &&
+         batch_desc.is_finished.load(std::memory_order_acquire)) ||
         task_count == 0) {
         status.s = Transport::TransferStatusEnum::COMPLETED;
         status.transferred_bytes =
@@ -409,6 +441,13 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
 
 Transport* MultiTransport::installTransport(const std::string& proto,
                                             std::shared_ptr<Topology> topo) {
+#ifdef USE_UBSMEM
+    if ((proto == "ubsmem" && !transport_map_.empty()) ||
+        transport_map_.count("ubsmem")) {
+        LOG(ERROR) << "UBS Memory must be the only installed payload transport";
+        return nullptr;
+    }
+#endif
 #ifdef USE_NCCL_HOST
     if ((proto == "nccl" && !transport_map_.empty()) ||
         (proto != "nccl" && transport_map_.count("nccl") != 0)) {
@@ -418,7 +457,13 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     }
 #endif
     Transport* transport = nullptr;
-    if (std::string(proto) == "rdma" || std::string(proto) == "rdma_twosided") {
+#ifdef USE_UBSMEM
+    if (proto == "ubsmem") {
+        transport = new UbsMemoryTransport();
+    } else
+#endif
+        if (std::string(proto) == "rdma" ||
+            std::string(proto) == "rdma_twosided") {
         if ((proto == "rdma" && transport_map_.count("rdma_twosided")) ||
             (proto == "rdma_twosided" && transport_map_.count("rdma"))) {
             LOG(ERROR) << "Cannot install both rdma and rdma_twosided "

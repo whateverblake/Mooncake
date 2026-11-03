@@ -55,6 +55,10 @@ if(USE_HTTP)
 endif()
 
 add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+if(USE_UBSMEM)
+  target_link_libraries(transfer_engine PUBLIC ubsmem_memory)
+  target_sources(transfer_engine PRIVATE $<TARGET_OBJECTS:ubsmem_transport>)
+endif()
 target_include_directories(
   transfer_engine
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
