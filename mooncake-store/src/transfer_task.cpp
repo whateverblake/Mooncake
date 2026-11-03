@@ -1607,8 +1607,9 @@ bool TransferSubmitter::validateTransferParams(
     const std::vector<Slice>& slices) const {
     uint64_t all_slice_len = 0;
     for (auto slice : slices) {
-        if (slice.size > handle.size_ - all_slice_len ||
-            (slice.size && !slice.ptr))
+        if (handle.protocol_ == "ubsmem" &&
+            (slice.size > handle.size_ - all_slice_len ||
+             (slice.size && !slice.ptr)))
             return false;
         all_slice_len += slice.size;
     }

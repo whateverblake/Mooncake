@@ -87,8 +87,15 @@ class AllocatedBuffer {
         std::string protocol_;
         std::string transport_endpoint_;
         uint64_t ubsmem_allocation_id_ = 0;
+#ifdef USE_UBSMEM
+        // Only UBS builds carry the allocation ID, so other builds keep the
+        // existing master/client wire format.
         YLT_REFL(Descriptor, size_, buffer_address_, protocol_,
                  transport_endpoint_, ubsmem_allocation_id_);
+#else
+        YLT_REFL(Descriptor, size_, buffer_address_, protocol_,
+                 transport_endpoint_);
+#endif
     };
 
     void change_to_cxl(std::string client_segment_name);

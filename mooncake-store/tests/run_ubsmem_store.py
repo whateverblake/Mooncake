@@ -95,13 +95,17 @@ def main():
             env={**os.environ, "MC_TE_HANDSHAKE_PORT": str(provider_port)},
         )
         wait_until(lambda: (session / "ready").exists(), provider)
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{metrics_port}/get_all_segments", timeout=5
-        ) as response:
-            names = response.read().decode().splitlines()
-        expected = f"127.0.0.1:{provider_port}"
-        if expected not in names:
-            raise RuntimeError(f"Provider segment {expected} missing from {names}")
+        # Only UBS pools take their segment name from MC_TE_HANDSHAKE_PORT.
+        if not args.tcp:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{metrics_port}/get_all_segments", timeout=5
+            ) as response:
+                names = response.read().decode().splitlines()
+            expected = f"127.0.0.1:{provider_port}"
+            if expected not in names:
+                raise RuntimeError(
+                    f"Provider segment {expected} missing from {names}"
+                )
         for role in ("producer", "consumer"):
             client = start(role, [args.client, prefix + role, endpoint, str(session)])
             if client.wait(timeout=30) != 0:

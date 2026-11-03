@@ -82,9 +82,10 @@ revoke path instead of publishing a readable replica. [Store client](../mooncake
    **subranges** of that arena. B does not create a new named backing object
    for every key. [Segment manager](../mooncake-store/src/segment.cpp) · [Pool allocator](../mooncake-store/include/ubsmem_allocator.h)
 
-**Segment name and port.** In the classic P2P Store setup, a client given
-only a hostname and an explicit `MC_TE_HANDSHAKE_PORT` uses that port when
-forming its segment name. In the lab B both listens and mounts as
+**Segment name and port.** In the classic P2P Store setup, a `ubsmem` client
+given only a hostname and an explicit `MC_TE_HANDSHAKE_PORT` uses that port
+when forming its segment name. Other protocols keep the existing automatic
+port selection. In the lab B both listens and mounts as
 `127.0.0.1:16002`. An explicitly supplied logical `host:port` is preserved.
 The master RPC address is separate. You can inspect the names actually
 mounted with `curl http://127.0.0.1:9013/get_all_segments` inside the
@@ -122,8 +123,10 @@ access. [Guarded copy](src/transport/ubsmem_transport/ubsmem_memory.cpp)
 
 The submitting thread prepares work and enqueues it. One worker per transport
 acquires arena access, copies the slice and releases access before reporting
-success. Queue capacity is 256 pending requests. The default queue and lock deadline is
-30 seconds. Staging memory must live
+success. Queue capacity is 256 pending requests. When the queue is full,
+submission waits for space instead of failing, so a large Store batch is
+throttled rather than rejected. The default queue and lock deadline is
+30 seconds; a request that cannot enter the queue before its deadline fails. Staging memory must live
 through completion. Store disables its ordinary local memcpy shortcut for
 UBSMEM, including B's Put/Get against its own pool. Self-targeted transfers
 must take the same ownership lock as remote ones.
@@ -343,22 +346,24 @@ arena for a new session.
   backing files. Establish that the old processes have released their
   mappings before cleanup.
 - Master restart requires a fresh pool and session. Allocation IDs and
-  operation records live in the master process. Rebuild and run matching
-  master and client versions because the internal Store descriptor carries
-  the UBS allocation ID.
+  operation records live in the master process. With `USE_UBSMEM=ON`, the
+  internal Store descriptor carries the UBS allocation ID, so rebuild and run
+  matching master and client versions. Builds without `USE_UBSMEM` keep the
+  existing descriptor wire format, and their master rejects `ubsmem` mounts.
 
 ## Validation
 
 | Test area | What the tests verify |
 | --- | --- |
-| Arena and Transfer Engine | Named mapping and descriptor validation, self-targeted and imported READ/WRITE, range checks, lock contention, queue limits and metadata publication failures. |
+| Arena and Transfer Engine | Named mapping and descriptor validation, self-targeted and imported READ/WRITE, range checks, lock contention, queue deadlines, a 600-request batch that waits for queue space, and metadata publication failures. |
 | Allocator and transfer references | Reuse in a small pool, merging adjacent free ranges, multiple pins, stale descriptors and replayed Begin/End operations. |
 | Store end to end | A real master and separate B/A/C processes, successful Put/Get, configured segment name visible through the master, grouped transfers, full-pool reuse and refusal to reuse a range while pinned. |
 | Failure and compatibility | Injected ownership-release failure retains the affected reservation. Separate tests cover master policy rejection and TCP Store and Transfer Engine transfers. |
 
-The polling-mode container suite passed all nine tests after the segment-name
-and conditional-pinning fixes. Three Transfer Engine tests passed in the
-separate event-driven build. The Store end-to-end scenarios were exercised
+The polling-mode container suite passed all nine tests after the queue
+backpressure fix and the isolation of non-UBS behavior. Three Transfer Engine
+tests passed in the separate event-driven build. A separate `USE_UBSMEM=OFF`
+build of the master, Store and Transfer Engine also compiles. The Store end-to-end scenarios were exercised
 in polling mode. The Linux mock exercises process boundaries and data
 integrity. Hardware cache coherence, cross-server performance and lock expiry
 still need hardware testing. [Three-process test](../mooncake-store/tests/ubsmem_store_test.cpp) · [Session runner](../mooncake-store/tests/run_ubsmem_store.py) · [Allocator tests](../mooncake-store/tests/ubsmem_allocator_test.cpp) · [Ownership fault test](../mooncake-store/tests/ubsmem_ownership_test.cpp) · [Transport tests](tests/ubsmem_transport_test.cpp)

@@ -52,6 +52,7 @@ class UbsMemoryTransport final : public Transport {
 
     std::mutex mutex_;
     std::condition_variable ready_;
+    std::condition_variable space_;
     std::map<uintptr_t, std::shared_ptr<Registration>> registrations_;
     std::map<std::string, std::shared_ptr<UbsMemoryArena>> imports_;
     std::deque<Work> queue_;

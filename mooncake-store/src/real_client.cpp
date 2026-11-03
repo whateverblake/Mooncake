@@ -801,14 +801,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 
     std::string hostname = local_hostname;
+    // A UBS pool is mounted under its handshake port so the segment name
+    // matches the Transfer Engine endpoint. Other protocols keep port retry.
     const char *handshake_port = std::getenv("MC_TE_HANDSHAKE_PORT");
-#ifdef USE_TENT
-    if (std::getenv("MC_USE_TENT") || std::getenv("MC_USE_TEV1")) {
-        handshake_port = nullptr;  // Only the classic engine binds this port.
-    }
-#endif
-    if (handshake_port && metadata_server == P2PHANDSHAKE &&
-        protocol != "rpc_only" && !transfer_engine &&
+    if (protocol == "ubsmem" && handshake_port &&
+        metadata_server == P2PHANDSHAKE && !transfer_engine &&
         !hasExplicitPort(hostname)) {
         auto port = parseFromString<uint16_t>(handshake_port);
         if (!port || *port == 0) {

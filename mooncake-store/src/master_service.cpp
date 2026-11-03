@@ -891,6 +891,12 @@ tl::expected<void, ErrorCode> MasterService::EndUbsMemoryTransfer(
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+#ifndef USE_UBSMEM
+    if (segment.protocol == "ubsmem") {
+        LOG(ERROR) << "This master was built without UBS Memory support";
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+#endif
     if (segment.protocol == "ubsmem" &&
         (eviction_ratio_ != 0.0 || eviction_high_watermark_ratio_ != 1.0 ||
          enable_ha_ || snapshot_object_store_ || enable_offload_ ||

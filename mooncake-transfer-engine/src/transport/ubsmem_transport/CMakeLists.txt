@@ -17,6 +17,9 @@ add_library(ubsmem_memory STATIC ubsmem_memory.cpp ${UBSMEM_BACKEND_SOURCE})
 target_include_directories(ubsmem_memory
                            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../../../include)
 target_link_libraries(ubsmem_memory PUBLIC pthread)
+# BufferDesc includes UBS fields only with this definition. Export it so every
+# consumer of the Transfer Engine headers sees the same layout.
+target_compile_definitions(ubsmem_memory PUBLIC USE_UBSMEM)
 if(UBSMEM_BACKEND STREQUAL "sdk")
   target_include_directories(ubsmem_memory PRIVATE ${UBSMEM_INCLUDE_DIR})
   target_link_libraries(ubsmem_memory PUBLIC ${UBSMEM_LIBRARY})

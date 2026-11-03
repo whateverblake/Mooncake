@@ -199,8 +199,9 @@ int main(int argc, char** argv) {
             const int blocker = open(path.c_str(), O_RDWR | O_CLOEXEC);
             require(blocker >= 0 && flock(blocker, LOCK_EX) == 0, "block peer");
             request.target_offset = reinterpret_cast<uintptr_t>(arena->base());
-            auto batch = client.allocateBatchID(300);
-            std::vector<mooncake::TransferRequest> queued(300, request);
+            // Stay below queue capacity so submission returns while blocked.
+            auto batch = client.allocateBatchID(200);
+            std::vector<mooncake::TransferRequest> queued(200, request);
             require(client.submitTransfer(batch, queued).ok(), "submit queue");
             require(!client.freeBatchID(batch).ok(), "active batch is busy");
             require(client.unregisterLocalMemory(buffer.data()) != 0,
@@ -234,6 +235,35 @@ int main(int argc, char** argv) {
             require(
                 transfer(client, request).s == mooncake::Transport::COMPLETED,
                 "copy after contention clears");
+
+            // A batch larger than the queue waits for space instead of
+            // failing while a peer briefly holds the lock.
+            const int peer = open(path.c_str(), O_RDWR | O_CLOEXEC);
+            require(peer >= 0 && flock(peer, LOCK_EX) == 0, "block peer again");
+            std::thread unblock([peer] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                flock(peer, LOCK_UN);
+            });
+            auto large = client.allocateBatchID(600);
+            std::vector<mooncake::TransferRequest> backlog(600, request);
+            const bool submitted = client.submitTransfer(large, backlog).ok();
+            unblock.join();
+            close(peer);
+            require(submitted, "submit batch larger than queue");
+            mooncake::TransferStatus aggregate{};
+            const auto drained =
+                std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            do {
+                require(client.getBatchTransferStatus(large, aggregate).ok(),
+                        "backlog poll");
+                require(aggregate.s != mooncake::Transport::FAILED,
+                        "full queue must not fail queued work");
+                require(std::chrono::steady_clock::now() < drained,
+                        "backlog did not drain");
+            } while (aggregate.s != mooncake::Transport::COMPLETED);
+            require(aggregate.transferred_bytes == backlog.size() * 64,
+                    "backlog byte count");
+            require(client.freeBatchID(large).ok(), "free drained backlog");
             for (int i = 0; i < 100; ++i) {
                 require(transfer(client, request, i % 2 == 0).s ==
                             mooncake::Transport::COMPLETED,

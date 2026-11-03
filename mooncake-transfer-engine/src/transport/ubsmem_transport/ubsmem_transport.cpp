@@ -27,6 +27,7 @@ UbsMemoryTransport::~UbsMemoryTransport() {
         stopping_ = true;
     }
     ready_.notify_one();
+    space_.notify_all();
     if (worker_.joinable()) worker_.join();
 }
 
@@ -194,9 +195,13 @@ Status UbsMemoryTransport::submitTransferTask(
                   std::chrono::steady_clock::now() + timeout_};
         bool queued = false;
         try {
-            std::lock_guard lock(mutex_);
-            if (!stopping_ && queue_.size() < kQueueCapacity &&
-                prepare(request, work)) {
+            std::unique_lock lock(mutex_);
+            // A full queue applies backpressure until the request's deadline.
+            const bool has_space =
+                space_.wait_until(lock, work.deadline, [this] {
+                    return stopping_ || queue_.size() < kQueueCapacity;
+                });
+            if (has_space && !stopping_ && prepare(request, work)) {
                 queue_.push_back(std::move(work));
                 queued = true;
             }
@@ -225,6 +230,7 @@ void UbsMemoryTransport::run() {
             queue_.pop_front();
             stopping = stopping_;
         }
+        space_.notify_one();
         bool success = false;
         bool uncertain = false;
         try {
