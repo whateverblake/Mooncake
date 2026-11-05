@@ -1,6 +1,10 @@
 #include "transport/ubsmem_transport/ubsmem_memory.h"
 
+#include <unistd.h>
+
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -22,7 +26,26 @@ bool validName(const std::string& name) {
 std::string identity(const UbsMemoryDescriptor& desc) {
     return desc.backend + ":" + desc.domain + ":" + desc.object_name;
 }
+
+// Copies must reach memory before the transfer reports completion.
+void completeMemoryAccesses() {
+#if defined(__aarch64__)
+    asm volatile("dsb sy" ::: "memory");
+#else
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+}
 }  // namespace
+
+std::string UbsMemoryArena::accessMode() {
+    const char* value = std::getenv("MC_UBSMEM_ACCESS_MODE");
+    const std::string mode = value && *value ? value : "cache";
+    if (mode != "cache" && mode != "import-noncache") {
+        throw std::invalid_argument(
+            "MC_UBSMEM_ACCESS_MODE must be cache or import-noncache");
+    }
+    return mode;
+}
 
 bool UbsMemoryDescriptor::valid() const {
     return version == 1 && (backend == "mock" || backend == "sdk") &&
@@ -30,7 +53,8 @@ bool UbsMemoryDescriptor::valid() const {
            validName(generation) && object_size > 0 &&
            object_size % UbsMemoryArena::kAlignment == 0 &&
            object_size <= std::numeric_limits<size_t>::max() &&
-           object_offset < object_size;
+           object_offset < object_size &&
+           (access == "cache" || access == "import-noncache");
 }
 
 std::shared_ptr<UbsMemoryArena> UbsMemoryArena::create(size_t size) {
@@ -107,15 +131,22 @@ bool UbsMemoryArena::copy(size_t offset, void* buffer, size_t length,
         std::chrono::steady_clock::now() >= deadline) {
         return false;
     }
+    // Ownership changes work on whole pages. Allocations are page aligned,
+    // so the pages belong to this copy's allocation.
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t first = offset / page * page;
+    const size_t span =
+        std::min(size(), (offset + length + page - 1) / page * page) - first;
     try {
-        if (!acquire(write, deadline)) return false;
+        if (!acquire(first, span, write, deadline)) return false;
         auto* target = static_cast<char*>(base_) + offset;
         if (write) {
             std::memcpy(target, buffer, length);
         } else {
             std::memcpy(buffer, target, length);
         }
-        if (!release()) {
+        completeMemoryAccesses();
+        if (!release(first, span)) {
             throw std::runtime_error("UBS ownership release is uncertain");
         }
     } catch (...) {

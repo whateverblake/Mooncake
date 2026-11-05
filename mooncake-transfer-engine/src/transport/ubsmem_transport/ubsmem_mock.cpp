@@ -23,7 +23,13 @@ struct Header {
     uint64_t magic;
     uint64_t size;
     char generation[48];
+    char access[16];
 };
+
+bool sameText(const char* field, size_t capacity, const std::string& value) {
+    return strnlen(field, capacity) == value.size() &&
+           std::memcmp(field, value.data(), value.size()) == 0;
+}
 
 std::string readIdentity(const char* path) {
     std::ifstream input(path);
@@ -77,6 +83,8 @@ class MockArena final : public UbsMemoryArena {
             header.size = size();
             std::memcpy(header.generation, descriptor_.generation.c_str(),
                         descriptor_.generation.size());
+            std::memcpy(header.access, descriptor_.access.c_str(),
+                        descriptor_.access.size());
             if (ftruncate(fd_, size() + kHeaderBytes) != 0 ||
                 pwrite(fd_, &header, sizeof(header), 0) != sizeof(header)) {
                 throw std::runtime_error("Cannot create UBS mock object");
@@ -87,14 +95,16 @@ class MockArena final : public UbsMemoryArena {
             statbuf.st_size != static_cast<off_t>(size()) + kHeaderBytes ||
             pread(fd_, &header, sizeof(header), 0) != sizeof(header) ||
             header.magic != kMagic || header.size != size() ||
-            strnlen(header.generation, sizeof(header.generation)) !=
-                descriptor_.generation.size() ||
-            std::memcmp(header.generation, descriptor_.generation.data(),
-                        descriptor_.generation.size()) != 0) {
+            !sameText(header.generation, sizeof(header.generation),
+                      descriptor_.generation) ||
+            !sameText(header.access, sizeof(header.access),
+                      descriptor_.access)) {
             throw std::invalid_argument("Stale UBS mock backing object");
         }
+        // A non-cached import needs no per-copy permission changes.
+        const int prot = cached() ? PROT_NONE : PROT_READ | PROT_WRITE;
         void* mapping =
-            mmap(nullptr, size(), PROT_NONE, MAP_SHARED, fd_, kHeaderBytes);
+            mmap(nullptr, size(), prot, MAP_SHARED, fd_, kHeaderBytes);
         if (mapping == MAP_FAILED) {
             throw std::runtime_error("Cannot map UBS mock object");
         }
@@ -102,18 +112,34 @@ class MockArena final : public UbsMemoryArena {
     }
 
    private:
-    bool acquire(bool write, Deadline deadline) override {
-        const int operation = (write ? LOCK_EX : LOCK_SH) | LOCK_NB;
-        while (flock(fd_, operation) != 0) {
-            if ((errno != EWOULDBLOCK && errno != EINTR) ||
+    bool cached() const { return descriptor_.access == "cache"; }
+
+    // Mock-only check of the master's exclusivity. A byte-range lock on the
+    // copied pages never conflicts in correct use, so it does not serialize
+    // the pool. Tests hold a range to simulate a stalled peer.
+    bool rangeLock(size_t offset, size_t length, short type) {
+        struct flock range{};
+        range.l_type = type;
+        range.l_whence = SEEK_SET;
+        range.l_start = kHeaderBytes + static_cast<off_t>(offset);
+        range.l_len = static_cast<off_t>(length);
+        return fcntl(fd_, F_OFD_SETLK, &range) == 0;
+    }
+
+    bool acquire(size_t offset, size_t length, bool write,
+                 Deadline deadline) override {
+        while (!rangeLock(offset, length, write ? F_WRLCK : F_RDLCK)) {
+            if ((errno != EAGAIN && errno != EACCES && errno != EINTR) ||
                 std::chrono::steady_clock::now() >= deadline) {
                 return false;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        if (mprotect(base_, size(),
-                     write ? PROT_READ | PROT_WRITE : PROT_READ) != 0) {
-            if (flock(fd_, LOCK_UN) != 0) {
+        auto* start = static_cast<char*>(base_) + offset;
+        if (cached() && mprotect(start, length,
+                                 write ? PROT_READ | PROT_WRITE : PROT_READ) !=
+                            0) {
+            if (!rangeLock(offset, length, F_UNLCK)) {
                 throw std::runtime_error("UBS rollback unlock is uncertain");
             }
             return false;
@@ -121,10 +147,11 @@ class MockArena final : public UbsMemoryArena {
         return true;
     }
 
-    bool release() override {
-        // Do not grant another process access if revoking ours fails.
-        if (mprotect(base_, size(), PROT_NONE) != 0) return false;
-        return flock(fd_, LOCK_UN) == 0;
+    bool release(size_t offset, size_t length) override {
+        // Do not let another copy start if revoking our access fails.
+        auto* start = static_cast<char*>(base_) + offset;
+        if (cached() && mprotect(start, length, PROT_NONE) != 0) return false;
+        return rangeLock(offset, length, F_UNLCK);
     }
 
     bool removeBacking() override {
@@ -153,6 +180,7 @@ std::shared_ptr<UbsMemoryArena> createUbsMemoryBackend(size_t size) {
     descriptor.generation = readIdentity("/proc/sys/kernel/random/uuid");
     descriptor.object_name = "mc-" + descriptor.generation;
     descriptor.object_size = size;
+    descriptor.access = UbsMemoryArena::accessMode();
     auto arena = std::make_shared<MockArena>(descriptor, true);
     arena->open();
     return arena;

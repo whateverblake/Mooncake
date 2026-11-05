@@ -152,9 +152,14 @@ class UbsMemoryBufferAllocator final
         free_.emplace(0, capacity);
     }
 
+    // Page granularity keeps each allocation's cache lines and ownership
+    // pages apart from other keys.
+    static constexpr size_t kGranularity = 4096;
+
     std::unique_ptr<AllocatedBuffer> allocate(size_t length) override {
-        if (!length || length > SIZE_MAX - 63) return nullptr;
-        const size_t reserved = (length + 63) & ~size_t{63};
+        if (!length || length > SIZE_MAX - (kGranularity - 1)) return nullptr;
+        const size_t reserved =
+            (length + kGranularity - 1) & ~(kGranularity - 1);
         size_t offset;
         {
             std::lock_guard lock(mutex_);

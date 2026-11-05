@@ -125,21 +125,23 @@ The submitting thread prepares work and enqueues it. One worker per transport
 acquires arena access, copies the slice and releases access before reporting
 success. Queue capacity is 256 pending requests. When the queue is full,
 submission waits for space instead of failing, so a large Store batch is
-throttled rather than rejected. The default queue and lock deadline is
-30 seconds; a request that cannot enter the queue before its deadline fails. Staging memory must live
-through completion. Store disables its ordinary local memcpy shortcut for
-UBSMEM, including B's Put/Get against its own pool. Self-targeted transfers
-must take the same ownership lock as remote ones.
+throttled rather than rejected. The default request deadline is 30 seconds;
+a request that cannot enter the queue before its deadline fails. Staging
+memory must live through completion. Store disables its ordinary local memcpy
+shortcut for UBSMEM, including B's Put/Get against its own pool.
+Self-targeted transfers use the same cache steps as remote ones.
 
-**Two mechanisms protect different things.** The arena lock controls who can
-access bytes during a copy. The master reference prevents an object's range
-from being assigned to another key while that copy is possible. Master-held
+**No cross-process lock.** The master keeps clients apart: each Put gets its
+own range, a key is visible only after its Put completes, and the master
+reference stops a range from being reused while a copy may still use it. A
+copy therefore needs only cache consistency for the pages it touches; see
+[Access modes](#access-modes-and-cache-consistency). Master-held
 references cost a Begin and an End RPC per allocation used by a transfer.
 This design keeps reuse decisions in one place and avoids a shared allocation
 table that every client would need to update.
 
 1. The master reserves the first sufficiently large free range in address
-   order. It rounds the reservation to 64 bytes and gives it a fresh nonzero
+   order. It rounds the reservation to 4 KiB and gives it a fresh nonzero
    allocation ID. The descriptor still reports the requested payload size.
 2. Before submission, the Store client asks the master to pin the descriptor.
    The master checks the ID, address, size, protocol and endpoint. Grouped
@@ -163,9 +165,43 @@ already have reached the master. [Master RPCs](../mooncake-store/src/master_serv
 | Outcome | What happens to the range |
 | --- | --- |
 | Copy and ownership release succeed | After all slices finish, Store ends the transfer reference. A live object still owns its range. |
-| Validation, queue admission or lock deadline fails with ownership known | The task fails. Once work is confirmed finished, Store can release the reference and revoke a failed Put. |
+| Validation, queue admission or request deadline fails with ownership known | The task fails. Once work is confirmed finished, Store can release the reference and revoke a failed Put. |
 | Ownership release or rollback is uncertain | The arena is marked failed. Once slices stop using staging, the batch reports uncertainty and its master references stay held. |
 | Client disappears with an active pin | The affected reservation can remain held. A heartbeat timeout cannot prove that a paused or disconnected writer has stopped. |
+
+## Access modes and cache consistency
+
+UB shared memory is mapped cacheable by default, and the CPU caches of
+different nodes are not kept consistent. Writing once is not enough: A's
+bytes can stay in A's cache after its `memcpy`, and C can hold old lines
+from a key that used the same range before. `MC_UBSMEM_ACCESS_MODE` on B
+selects how each copy handles this. The descriptor records the mode, so A and
+C follow the pool's creator.
+
+| Mode | Each copy does | Requirements |
+| --- | --- | --- |
+| `cache` (default) | Grant access to the copy's pages, `memcpy`, then revoke access. | BIOS `snoop` off. |
+| `import-noncache` | Only `memcpy`. A and C map B's pool uncached, so their accesses go to B's memory. | BIOS `snoop` on. |
+
+In `cache` mode the SDK adapter calls `ubsmem_shmem_set_ownership` on the
+copy's pages: `PROT_READ` or `PROT_READ | PROT_WRITE` before the copy and
+`PROT_NONE` after it. These are the same OBMM ownership changes that the
+SDK's read lock, write lock and unlock perform. The SDK locks also take a
+distributed lock on the whole object, which is not used here. Pages stay at
+`PROT_NONE` between copies, so the CPU cannot keep or prefetch their lines.
+Each Put and Get therefore reads or writes B's memory. Store allocations are
+4 KiB aligned, so two keys never share a page or cache line.
+
+`import-noncache` allocates with `UBSM_FLAG_ONLY_IMPORT_NONCACHE |
+UBSM_FLAG_WR_DELAY_COMP`. The second flag selects the non-relay mode that
+the user guide requires for non-cached consistency. A mapping on the
+exporting node itself stays cacheable. Uncached accesses are slower per byte
+but need no system call per copy. A Get still copies the value into the
+caller's buffer once, and later reads of that buffer use the normal cache.
+
+Each mode supports one BIOS `snoop` setting, and the service rejects the
+other mode. Both modes still need hardware validation; see
+[Hardware adapter](#hardware-adapter).
 
 ## Mock, SDK and original test case
 
@@ -179,13 +215,13 @@ The Mooncake build selects **one** arena backend:
 
 | Backend | Allocation, access and cleanup |
 | --- | --- |
-| `mock` (current CLion build) | Mooncake's own C++ mock creates a session file, sizes it with `ftruncate` and maps it with `MAP_SHARED`. A header records size and generation. Readers use shared `flock` and writers use exclusive `flock`. `mprotect` enables access during the copy and restores `PROT_NONE` afterwards. A separate lease file prevents B from deleting a backing object with live importers. |
-| `sdk` (optional hardware adapter) | B requests a named UBS object from the configured region or provider, looks up its size and maps it. The adapter uses UBS read/write locks and unlock for access. B manages this object's lifetime even when the SDK obtains the memory from a different physical node. |
+| `mock` (current CLion build) | Mooncake's own C++ mock creates a session file, sizes it with `ftruncate` and maps it with `MAP_SHARED`. A header records size, generation and access mode. In `cache` mode, `mprotect` grants access to the copy's pages and restores `PROT_NONE` afterwards. A byte-range lock on just those pages checks the master's exclusivity; it never conflicts in correct use, and tests hold it to simulate a stalled peer. A separate lease file prevents B from deleting a backing object with live importers. |
+| `sdk` (optional hardware adapter) | B requests a named UBS object from the configured region or provider, looks up its size and maps it. Copies use per-range `ubsmem_shmem_set_ownership` or an uncached mapping, as described above. B manages this object's lifetime even when the SDK obtains the memory from a different physical node. |
 
 The Mooncake mock never enters the original C mock's
 `ubsmem_shmem_allocate()`. To watch allocation today, break in
 `MockArena::open()`. Calling the original C API from Mooncake would require
-a backend integration that preserves the lock, bounds and lifetime rules above.
+a backend integration that preserves the access, bounds and lifetime rules above.
 The existing `ub` protocol uses URMA. The existing Ascend `ubshmem` protocol
 uses CANN memory export/import and device copies. Select `ubsmem` for this
 CPU named-memory path. [Backend selection](src/transport/ubsmem_transport/CMakeLists.txt) · [Mooncake mock](src/transport/ubsmem_transport/ubsmem_mock.cpp) · [SDK adapter](src/transport/ubsmem_transport/ubsmem_sdk.cpp)
@@ -292,10 +328,10 @@ eviction for UBS pools.
 - `UbsMemoryBufferAllocator::releaseRange`: reclaim and merge a deleted range.
 - `UbsMemoryTransport::prepare`: descriptor lookup and address translation.
 - `UbsMemoryArena::copy`: the guarded payload copy.
-- `MockArena::acquire` and `MockArena::release`: lock and permission transitions.
+- `MockArena::acquire` and `MockArena::release`: per-range checks and permission transitions.
 - `UbsMemoryTransport::run`: completion after successful release.
 
-The mapping has `PROT_NONE` outside a copy. Do not evaluate its contents in
+In `cache` mode the mapping has `PROT_NONE` outside a copy. Do not evaluate its contents in
 the debugger until execution is inside the access guard. Its address is
 still useful for inspection and registration.
 
@@ -355,9 +391,9 @@ arena for a new session.
 
 | Test area | What the tests verify |
 | --- | --- |
-| Arena and Transfer Engine | Named mapping and descriptor validation, self-targeted and imported READ/WRITE, range checks, lock contention, queue deadlines, a 600-request batch that waits for queue space, and metadata publication failures. |
+| Arena and Transfer Engine | Named mapping and descriptor validation, self-targeted and imported READ/WRITE, range checks, a stalled range that does not block other ranges of the pool, both access modes, queue deadlines, a 600-request batch that waits for queue space, and metadata publication failures. |
 | Allocator and transfer references | Reuse in a small pool, merging adjacent free ranges, multiple pins, stale descriptors and replayed Begin/End operations. |
-| Store end to end | A real master and separate B/A/C processes, successful Put/Get, configured segment name visible through the master, grouped transfers, full-pool reuse and refusal to reuse a range while pinned. |
+| Store end to end | A real master and separate B/A/C processes in both access modes, successful Put/Get, configured segment name visible through the master, grouped transfers, full-pool reuse and refusal to reuse a range while pinned. |
 | Failure and compatibility | Injected ownership-release failure retains the affected reservation. Separate tests cover master policy rejection and TCP Store and Transfer Engine transfers. |
 
 The polling-mode container suite passed all nine tests after the queue
@@ -365,8 +401,8 @@ backpressure fix and the isolation of non-UBS behavior. Three Transfer Engine
 tests passed in the separate event-driven build. A separate `USE_UBSMEM=OFF`
 build of the master, Store and Transfer Engine also compiles. The Store end-to-end scenarios were exercised
 in polling mode. The Linux mock exercises process boundaries and data
-integrity. Hardware cache coherence, cross-server performance and lock expiry
-still need hardware testing. [Three-process test](../mooncake-store/tests/ubsmem_store_test.cpp) · [Session runner](../mooncake-store/tests/run_ubsmem_store.py) · [Allocator tests](../mooncake-store/tests/ubsmem_allocator_test.cpp) · [Ownership fault test](../mooncake-store/tests/ubsmem_ownership_test.cpp) · [Transport tests](tests/ubsmem_transport_test.cpp)
+integrity. Hardware cache consistency and cross-server performance still need
+hardware testing. [Three-process test](../mooncake-store/tests/ubsmem_store_test.cpp) · [Session runner](../mooncake-store/tests/run_ubsmem_store.py) · [Allocator tests](../mooncake-store/tests/ubsmem_allocator_test.cpp) · [Ownership fault test](../mooncake-store/tests/ubsmem_ownership_test.cpp) · [Transport tests](tests/ubsmem_transport_test.cpp)
 
 ## Hardware adapter
 
@@ -375,24 +411,24 @@ at commit `26e900125b47ff835b443622288e3f0124e752f6`. Configure
 `UBSMEM_INCLUDE_DIR` and `UBSMEM_LIBRARY` for `ubs_mem.h` and `libubsm_sdk`.
 With `BUILD_UBSMEM_TESTS=ON`, the SDK build includes the Store tests:
 allocator, ownership fault, three-process Put/Get, TCP regression and master
-policy. The Transfer Engine tests use the mock's files and locks directly, so
-they are built only with the mock backend.
+policy. The Transfer Engine tests use the mock's files and range locks
+directly, so they are built only with the mock backend.
 
-The adapter allocates with exactly `UBSM_FLAG_WITH_LOCK`, maps with
-`MAP_SHARED`, and uses the SDK read/write locks and unlock operation. The
-service performs cache ownership transitions. `MC_UBSMEM_DOMAIN` identifies
+The adapter allocates with `UBSM_FLAG_CACHE` or, in `import-noncache` mode,
+`UBSM_FLAG_ONLY_IMPORT_NONCACHE | UBSM_FLAG_WR_DELAY_COMP`, and maps with
+`MAP_SHARED`. It does not use the SDK read/write locks. `MC_UBSMEM_DOMAIN` identifies
 the configured sharing domain. `MC_UBSMEM_REGION` defaults to `default`;
 `MC_UBSMEM_PROVIDER` optionally selects a provider host instead.
 
 Hardware mode refuses to initialize unless `MC_UBSMEM_SDK_QUALIFIED=1` is set.
 This is an operator gate, not a capability probe or proof of correctness.
-Before setting it, qualify cache visibility, DLock renewal/expiry during a
-long copy or debugger pause, allocation geometry, fault handling and service
-compatibility on actual UB hardware. The adapter has been syntax-checked
+Before setting it, qualify cache visibility in the selected access mode,
+allocation geometry, fault handling and service compatibility on actual UB
+hardware. The adapter has been syntax-checked
 against the pinned headers; it has not been run on UB hardware.
 
-The SDK API does not offer cancellation of an in-progress lock call. A local
-timeout cannot safely free memory still used by that call. On ownership
+The SDK API does not offer cancellation of an in-progress ownership call. A
+local timeout cannot safely free memory still used by that call. On ownership
 release failure or a reported UB fault, stop using the affected session and
 retain its allocation until the hardware services establish safe revocation.
 

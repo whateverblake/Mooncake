@@ -3,7 +3,6 @@
 
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/file.h>
 
 #include <array>
 #include <cstdlib>
@@ -192,12 +191,18 @@ int main(int argc, char** argv) {
             require(transfer(client, request).s == mooncake::Transport::FAILED,
                     "cross-boundary request fails");
 
-            // A separate open-file description holds the same interprocess
-            // lock that a stopped peer would hold, without a test-only hook.
+            // A separate open-file description holds the mock's range check
+            // over the object, as a peer stalled mid-copy would.
             const auto path =
                 std::string(directory) + "/" + arena->descriptor().object_name;
+            auto hold = [](int fd, short type) {
+                struct flock range{};
+                range.l_type = type;
+                range.l_whence = SEEK_SET;
+                return fcntl(fd, F_OFD_SETLKW, &range) == 0;
+            };
             const int blocker = open(path.c_str(), O_RDWR | O_CLOEXEC);
-            require(blocker >= 0 && flock(blocker, LOCK_EX) == 0, "block peer");
+            require(blocker >= 0 && hold(blocker, F_WRLCK), "block peer");
             request.target_offset = reinterpret_cast<uintptr_t>(arena->base());
             // Stay below queue capacity so submission returns while blocked.
             auto batch = client.allocateBatchID(200);
@@ -224,25 +229,25 @@ int main(int argc, char** argv) {
                         ++finished;
                     } else {
                         require(current.s != mooncake::Transport::COMPLETED,
-                                "copy bypassed peer lock");
+                                "copy bypassed stalled peer");
                     }
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
             require(client.freeBatchID(batch).ok(), "free timed-out batch");
-            require(flock(blocker, LOCK_UN) == 0, "unblock peer");
+            require(hold(blocker, F_UNLCK), "unblock peer");
             close(blocker);
             require(
                 transfer(client, request).s == mooncake::Transport::COMPLETED,
                 "copy after contention clears");
 
             // A batch larger than the queue waits for space instead of
-            // failing while a peer briefly holds the lock.
+            // failing while a peer briefly stalls.
             const int peer = open(path.c_str(), O_RDWR | O_CLOEXEC);
-            require(peer >= 0 && flock(peer, LOCK_EX) == 0, "block peer again");
-            std::thread unblock([peer] {
+            require(peer >= 0 && hold(peer, F_WRLCK), "block peer again");
+            std::thread unblock([peer, hold] {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                flock(peer, LOCK_UN);
+                hold(peer, F_UNLCK);
             });
             auto large = client.allocateBatchID(600);
             std::vector<mooncake::TransferRequest> backlog(600, request);

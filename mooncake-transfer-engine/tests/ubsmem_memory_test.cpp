@@ -1,7 +1,9 @@
 #include "transport/ubsmem_transport/ubsmem_memory.h"
 
-#include <sys/wait.h>
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <array>
@@ -32,10 +34,10 @@ class FailingReleaseArena final : public UbsMemoryArena {
     ~FailingReleaseArena() override { munmap(base_, size()); }
 
    private:
-    bool acquire(bool, Deadline) override {
+    bool acquire(size_t, size_t, bool, Deadline) override {
         return mprotect(base_, size(), PROT_READ | PROT_WRITE) == 0;
     }
-    bool release() override {
+    bool release(size_t, size_t) override {
         require(mprotect(base_, size(), PROT_NONE) == 0, "fault test revoke");
         return false;
     }
@@ -54,6 +56,7 @@ int main(int argc, char** argv) {
             desc.domain = argv[3];
             desc.host = argv[4];
             desc.object_size = std::stoull(argv[5]);
+            desc.access = "cache";
             void* parent_base = reinterpret_cast<void*>(std::stoull(argv[7]));
             void* reserved =
                 mmap(parent_base, desc.object_size, PROT_NONE,
@@ -162,9 +165,70 @@ int main(int argc, char** argv) {
         require(waitpid(access, &status, 0) == access, "wait protection");
         require(WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV,
                 "mapping inaccessible outside guard");
+
+        // Hold the mock's check on the first page only, as a peer stalled
+        // mid-copy would. Other ranges of the same pool stay usable.
+        const auto path = std::string(directory) + "/" + desc.object_name;
+        const int peer = open(path.c_str(), O_RDWR | O_CLOEXEC);
+        struct stat file{};
+        require(peer >= 0 && fstat(peer, &file) == 0, "open peer");
+        struct flock range{};
+        range.l_type = F_WRLCK;
+        range.l_whence = SEEK_SET;
+        range.l_start = file.st_size - static_cast<off_t>(arena->size());
+        const auto page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+        range.l_len = static_cast<off_t>(page);
+        require(fcntl(peer, F_OFD_SETLK, &range) == 0, "stall first page");
+        const auto soon = [] {
+            return std::chrono::steady_clock::now() +
+                   std::chrono::milliseconds(50);
+        };
+        require(!arena->copy(0, &value, 1, true, soon()),
+                "stalled range waits until its deadline");
+        require(arena->copy(2 * page, &value, 1, true, soon()),
+                "other ranges of the pool are not locked");
+        require(arena->copy(2 * page, &value, 1, false, soon()),
+                "other ranges remain readable");
+        close(peer);
+        require(arena->copy(0, &value, 1, true, soon()), "range released");
         require(arena->remove(), "remove quiescent arena");
         require(!arena->copy(0, &value, 1, true), "removed arena rejected");
         arena.reset();
+
+        setenv("MC_UBSMEM_ACCESS_MODE", "bogus", 1);
+        bool bad_mode = false;
+        try {
+            UbsMemoryArena::create(4 * 1024 * 1024);
+        } catch (const std::invalid_argument&) {
+            bad_mode = true;
+        }
+        require(bad_mode, "reject unknown access mode");
+        setenv("MC_UBSMEM_ACCESS_MODE", "import-noncache", 1);
+        auto uncached = UbsMemoryArena::create(4 * 1024 * 1024);
+        unsetenv("MC_UBSMEM_ACCESS_MODE");
+        require(uncached->descriptor().access == "import-noncache",
+                "descriptor records access mode");
+        value = 55;
+        require(uncached->copy(4096, &value, 1, true), "non-cached write");
+        const pid_t direct = fork();
+        require(direct >= 0, "fork non-cached check");
+        if (direct == 0) {
+            auto* ptr = static_cast<volatile unsigned char*>(uncached->base());
+            _exit(ptr[4096] == 55 ? 0 : 1);
+        }
+        require(waitpid(direct, &status, 0) == direct, "wait non-cached");
+        require(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                "non-cached mapping needs no per-copy access change");
+        auto mismatched = uncached->descriptor();
+        mismatched.access = "cache";
+        uncached.reset();
+        bool rejected_mode = false;
+        try {
+            UbsMemoryArena::import(mismatched);
+        } catch (const std::exception&) {
+            rejected_mode = true;
+        }
+        require(rejected_mode, "importer must follow the creator's mode");
         std::filesystem::remove_all(directory);
         std::cout << "UBSMEM_MEMORY_OK\n";
         return 0;

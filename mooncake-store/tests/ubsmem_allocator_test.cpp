@@ -4,11 +4,12 @@
 #include <stdexcept>
 
 int main() {
+    constexpr size_t kPage = mooncake::UbsMemoryBufferAllocator::kGranularity;
     try {
         auto registry =
             std::make_shared<mooncake::UbsMemoryAllocationRegistry>();
         auto allocator = std::make_shared<mooncake::UbsMemoryBufferAllocator>(
-            "owner", 0x1000000, 128, "owner:1234", registry);
+            "owner", 0x1000000, 2 * kPage, "owner:1234", registry);
         auto first = allocator->allocate(1);
         if (!first || first->get_descriptor().protocol_ != "ubsmem") {
             throw std::runtime_error("UBS allocation descriptor");
@@ -16,17 +17,25 @@ int main() {
         const auto address = first->data();
         first.reset();
         auto second = allocator->allocate(1);
-        if (!second || second->data() != address || allocator->size() != 64) {
+        if (!second || second->data() != address ||
+            allocator->size() != kPage) {
             throw std::runtime_error(
                 "Deleted allocation must restore capacity");
         }
+        auto neighbour = allocator->allocate(1);
+        const auto next_page = second->get_descriptor().buffer_address_ + kPage;
+        if (!neighbour ||
+            neighbour->get_descriptor().buffer_address_ != next_page) {
+            throw std::runtime_error("allocations must not share a page");
+        }
+        neighbour.reset();
         second.reset();
-        auto whole = allocator->allocate(128);
+        auto whole = allocator->allocate(2 * kPage);
         if (!whole || allocator->getLargestFreeRegion() != 0) {
             throw std::runtime_error("Adjacent free ranges must coalesce");
         }
         whole.reset();
-        auto pinned = allocator->allocate(128);
+        auto pinned = allocator->allocate(2 * kPage);
         const auto stale = pinned->get_descriptor();
         auto first_pin = registry->pin(stale);
         auto second_pin = registry->pin(stale);
@@ -43,7 +52,7 @@ int main() {
         first_pin.reset();
         if (allocator->allocate(1)) throw std::runtime_error("second pin lost");
         second_pin.reset();
-        auto reused = allocator->allocate(128);
+        auto reused = allocator->allocate(2 * kPage);
         if (!reused ||
             reused->get_descriptor().buffer_address_ != stale.buffer_address_ ||
             reused->get_descriptor().ubsmem_allocation_id_ ==
@@ -53,16 +62,16 @@ int main() {
         }
         reused.reset();
         for (int i = 0; i < 1000; ++i) {
-            if (!allocator->allocate(128))
+            if (!allocator->allocate(2 * kPage))
                 throw std::runtime_error("reuse loop");
         }
         if (allocator->size() != 0 ||
-            allocator->getLargestFreeRegion() != 128) {
+            allocator->getLargestFreeRegion() != 2 * kPage) {
             throw std::runtime_error("free space accounting");
         }
         mooncake::UbsMemoryTransferRegistry transfers(registry);
         mooncake::UUID client{1, 2};
-        auto live = allocator->allocate(128);
+        auto live = allocator->allocate(2 * kPage);
         auto descriptor = live->get_descriptor();
         if (!transfers.begin(client, 1, descriptor) ||
             !transfers.begin(client, 1, descriptor)) {
@@ -73,7 +82,7 @@ int main() {
             throw std::runtime_error("master pin missing");
         transfers.end(client, 1);
         transfers.end(client, 1);
-        auto next = allocator->allocate(128);
+        auto next = allocator->allocate(2 * kPage);
         if (!next || transfers.begin(client, 1, next->get_descriptor())) {
             throw std::runtime_error("ended operation must not reopen");
         }

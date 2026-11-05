@@ -12,12 +12,17 @@
 
 namespace mooncake {
 
-// A mapping is private to this process. Its pointer is only an address token
-// outside copy(); the backing pages have no read or write permission.
+// A mapping is private to this process. In "cache" access mode its pointer is
+// only an address token outside copy(): pages have no access between copies,
+// so the CPU cannot cache them. The master keeps clients apart; copy() takes
+// no cross-process lock, only the page range it touches.
 class UbsMemoryArena : public std::enable_shared_from_this<UbsMemoryArena> {
    public:
     using Deadline = std::chrono::steady_clock::time_point;
     static constexpr size_t kAlignment = 4 * 1024 * 1024;
+
+    // Reads MC_UBSMEM_ACCESS_MODE for new objects; "cache" by default.
+    static std::string accessMode();
 
     virtual ~UbsMemoryArena() = default;
     static std::shared_ptr<UbsMemoryArena> create(size_t size);
@@ -42,8 +47,10 @@ class UbsMemoryArena : public std::enable_shared_from_this<UbsMemoryArena> {
    protected:
     UbsMemoryArena(UbsMemoryDescriptor descriptor, bool owner)
         : descriptor_(std::move(descriptor)), owner_(owner) {}
-    virtual bool acquire(bool write, Deadline deadline) = 0;
-    virtual bool release() = 0;
+    // offset and length cover whole pages of the object.
+    virtual bool acquire(size_t offset, size_t length, bool write,
+                         Deadline deadline) = 0;
+    virtual bool release(size_t offset, size_t length) = 0;
     virtual bool removeBacking() = 0;
 
     UbsMemoryDescriptor descriptor_;

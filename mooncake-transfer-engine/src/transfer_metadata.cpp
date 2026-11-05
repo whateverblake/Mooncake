@@ -590,6 +590,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             item["generation"] = u.generation;
             item["object_size"] = Json::UInt64(u.object_size);
             item["object_offset"] = Json::UInt64(u.object_offset);
+            item["access"] = u.access;
             buffers.append(item);
         }
         segmentJSON["buffers"] = buffers;
@@ -1011,7 +1012,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
         for (const auto &item : buffers) {
             if (!item.isObject()) return nullptr;
             for (const char *field : {"name", "backend", "domain", "host",
-                                      "object_name", "generation"}) {
+                                      "object_name", "generation", "access"}) {
                 if (!item[field].isString()) return nullptr;
             }
             for (const char *field :
@@ -1033,6 +1034,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             u.generation = item["generation"].asString();
             u.object_size = item["object_size"].asUInt64();
             u.object_offset = item["object_offset"].asUInt64();
+            u.access = item["access"].asString();
             if (!u.valid() || buffer.name.empty() || !buffer.addr ||
                 !buffer.length || buffer.length > UINT64_MAX - buffer.addr ||
                 buffer.length > u.object_size - u.object_offset) {

@@ -101,6 +101,15 @@ if(BUILD_UBSMEM_TESTS)
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_ubsmem_store.py
       $<TARGET_FILE:mooncake_master> $<TARGET_FILE:ubsmem_store_test>)
   set_tests_properties(ubsmem_store_three_process PROPERTIES TIMEOUT 120)
+  add_test(
+    NAME ubsmem_store_three_process_noncache
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_ubsmem_store.py
+      $<TARGET_FILE:mooncake_master> $<TARGET_FILE:ubsmem_store_test>)
+  set_tests_properties(
+    ubsmem_store_three_process_noncache
+    PROPERTIES TIMEOUT 120 ENVIRONMENT MC_UBSMEM_ACCESS_MODE=import-noncache)
   if(USE_TCP)
     add_test(
       NAME ubsmem_store_tcp_regression

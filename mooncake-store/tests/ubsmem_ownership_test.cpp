@@ -14,8 +14,9 @@ namespace {
 class FailingArena final : public UbsMemoryArena {
    public:
     explicit FailingArena(size_t bytes)
-        : UbsMemoryArena({1, "mock", "test", "test", "fault", "1", bytes, 0},
-                         true) {
+        : UbsMemoryArena(
+              {1, "mock", "test", "test", "fault", "1", bytes, 0, "cache"},
+              true) {
         base_ =
             mmap(nullptr, bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (base_ == MAP_FAILED) throw std::runtime_error("fault arena mmap");
@@ -23,10 +24,10 @@ class FailingArena final : public UbsMemoryArena {
     ~FailingArena() override { munmap(base_, size()); }
 
    private:
-    bool acquire(bool, Deadline) override {
+    bool acquire(size_t, size_t, bool, Deadline) override {
         return mprotect(base_, size(), PROT_READ | PROT_WRITE) == 0;
     }
-    bool release() override {
+    bool release(size_t, size_t) override {
         mprotect(base_, size(), PROT_NONE);
         return false;
     }

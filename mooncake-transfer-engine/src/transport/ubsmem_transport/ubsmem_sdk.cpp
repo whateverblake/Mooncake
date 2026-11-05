@@ -27,7 +27,7 @@ std::string requiredSetting(const char* name) {
 class SdkContext {
    public:
     SdkContext() {
-        // The mock cannot qualify lock expiry or cache visibility on hardware.
+        // The mock cannot qualify cache visibility or faults on hardware.
         if (requiredSetting("MC_UBSMEM_SDK_QUALIFIED") != "1") {
             throw std::runtime_error("UBS hardware ownership is not qualified");
         }
@@ -66,6 +66,14 @@ class SdkArena final : public UbsMemoryArena {
     }
 
     void open() {
+        const bool cached = descriptor_.access == "cache";
+        // Cache mode needs snoop off and import-noncache needs snoop on; the
+        // service rejects the mode the BIOS setting does not support.
+        // WR_DELAY_COMP selects the non-relay mode the guide requires for
+        // non-cached consistency.
+        const uint64_t flags =
+            cached ? UBSM_FLAG_CACHE
+                   : UBSM_FLAG_ONLY_IMPORT_NONCACHE | UBSM_FLAG_WR_DELAY_COMP;
         if (descriptor_.backend != "sdk" || descriptor_.host != "ub-domain" ||
             descriptor_.domain != requiredSetting("MC_UBSMEM_DOMAIN") ||
             descriptor_.object_name != "mc-" + descriptor_.generation) {
@@ -84,13 +92,13 @@ class SdkArena final : public UbsMemoryArena {
                 provider.port_id = UINT32_MAX;
                 result = ubsmem_shmem_allocate_with_provider(
                     &provider, descriptor_.object_name.c_str(), size(), 0600,
-                    UBSM_FLAG_WITH_LOCK);
+                    flags);
             } else {
                 const char* region = std::getenv("MC_UBSMEM_REGION");
                 result =
                     ubsmem_shmem_allocate(region ? region : "default",
                                           descriptor_.object_name.c_str(),
-                                          size(), 0600, UBSM_FLAG_WITH_LOCK);
+                                          size(), 0600, flags);
             }
             if (result != 0) throw std::runtime_error("UBS allocation failed");
         }
@@ -101,7 +109,8 @@ class SdkArena final : public UbsMemoryArena {
             throw std::runtime_error("UBS object lookup/size mismatch");
         }
         descriptor_.object_size = info.size;
-        if (ubsmem_shmem_map(nullptr, size(), PROT_NONE, MAP_SHARED,
+        const int prot = cached ? PROT_NONE : PROT_READ | PROT_WRITE;
+        if (ubsmem_shmem_map(nullptr, size(), prot, MAP_SHARED,
                              descriptor_.object_name.c_str(), 0, &base_) != 0) {
             base_ = nullptr;
             throw std::runtime_error("UBS object mapping failed");
@@ -109,31 +118,33 @@ class SdkArena final : public UbsMemoryArena {
     }
 
    private:
-    bool acquire(bool write, Deadline deadline) override {
+    // Cache mode: granting access invalidates stale lines and revoking it
+    // writes back and invalidates this range. Pages without access cannot
+    // be cached between copies. No distributed lock is taken.
+    bool setOwnership(size_t offset, size_t length, int prot) {
+        auto* start = static_cast<char*>(base_) + offset;
+        return ubsmem_shmem_set_ownership(descriptor_.object_name.c_str(),
+                                          start, length, prot) == 0;
+    }
+
+    bool acquire(size_t offset, size_t length, bool write,
+                 Deadline deadline) override {
         if (failed_ || faulted.load(std::memory_order_acquire) ||
             std::chrono::steady_clock::now() >= deadline) {
             return false;
         }
-        const auto* name = descriptor_.object_name.c_str();
-        const int result = write ? ubsmem_shmem_write_lock(name)
-                                 : ubsmem_shmem_read_lock(name);
-        if (result != 0) {
+        if (descriptor_.access != "cache") return true;
+        if (!setOwnership(offset, length,
+                          write ? PROT_READ | PROT_WRITE : PROT_READ)) {
             failed_ = true;
-            throw std::runtime_error("UBS SDK lock ownership is uncertain");
-        }
-        if (faulted.load(std::memory_order_acquire) ||
-            std::chrono::steady_clock::now() >= deadline) {
-            if (!release()) {
-                throw std::runtime_error(
-                    "UBS SDK rollback unlock is uncertain");
-            }
-            return false;
+            throw std::runtime_error("UBS SDK ownership is uncertain");
         }
         return true;
     }
 
-    bool release() override {
-        if (ubsmem_shmem_unlock(descriptor_.object_name.c_str()) != 0 ||
+    bool release(size_t offset, size_t length) override {
+        if ((descriptor_.access == "cache" &&
+             !setOwnership(offset, length, PROT_NONE)) ||
             faulted.load(std::memory_order_acquire)) {
             failed_ = true;
             return false;
@@ -166,6 +177,7 @@ std::shared_ptr<UbsMemoryArena> createUbsMemoryBackend(size_t size) {
     }
     descriptor.object_name = "mc-" + descriptor.generation;
     descriptor.object_size = size;
+    descriptor.access = UbsMemoryArena::accessMode();
     auto arena = std::make_shared<SdkArena>(descriptor, true);
     arena->open();
     return arena;
