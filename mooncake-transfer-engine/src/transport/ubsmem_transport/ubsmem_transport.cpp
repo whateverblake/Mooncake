@@ -1,24 +1,43 @@
 #include "transport/ubsmem_transport/ubsmem_transport.h"
 
+#include <unistd.h>
+
+#include <algorithm>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 #include "common.h"
 #include "error.h"
 
 namespace mooncake {
+namespace {
+// Reads a positive integer setting no larger than limit.
+size_t readSetting(const char* name, size_t fallback, size_t limit) {
+    const char* value = std::getenv(name);
+    if (!value) return fallback;
+    size_t used = 0;
+    const auto result = std::stoll(value, &used);
+    if (used != std::string(value).size() || result <= 0 ||
+        static_cast<unsigned long long>(result) > limit) {
+        throw std::invalid_argument(std::string("Invalid ") + name);
+    }
+    return static_cast<size_t>(result);
+}
+}  // namespace
 
 UbsMemoryTransport::UbsMemoryTransport() {
-    if (const char* value = std::getenv("MC_UBSMEM_TIMEOUT_MS")) {
-        size_t used = 0;
-        const auto milliseconds = std::stoll(value, &used);
-        if (used != std::string(value).size() || milliseconds <= 0 ||
-            milliseconds > 3600000) {
-            throw std::invalid_argument("Invalid MC_UBSMEM_TIMEOUT_MS");
-        }
-        timeout_ = std::chrono::milliseconds(milliseconds);
+    timeout_ = std::chrono::milliseconds(
+        readSetting("MC_UBSMEM_TIMEOUT_MS", timeout_.count(), 3600000));
+    chunk_size_ =
+        readSetting("MC_UBSMEM_CHUNK_SIZE", chunk_size_, size_t{1} << 40);
+    // Chunks own whole pages, so concurrent copies never share one.
+    if (chunk_size_ % static_cast<size_t>(sysconf(_SC_PAGESIZE)) != 0) {
+        throw std::invalid_argument(
+            "MC_UBSMEM_CHUNK_SIZE must be a multiple of the page size");
     }
+    worker_count_ = readSetting("MC_UBSMEM_WORKERS", worker_count_, 64);
 }
 
 UbsMemoryTransport::~UbsMemoryTransport() {
@@ -26,9 +45,11 @@ UbsMemoryTransport::~UbsMemoryTransport() {
         std::lock_guard lock(mutex_);
         stopping_ = true;
     }
-    ready_.notify_one();
+    ready_.notify_all();
     space_.notify_all();
-    if (worker_.joinable()) worker_.join();
+    for (auto& worker : workers_) {
+        if (worker.joinable()) worker.join();
+    }
 }
 
 Status UbsMemoryTransport::freeBatchID(BatchID batch) {
@@ -49,7 +70,9 @@ int UbsMemoryTransport::install(std::string& name,
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, name, std::move(desc));
     const int result = metadata_->updateLocalSegmentDesc();
     if (result != 0) return result;
-    worker_ = std::thread(&UbsMemoryTransport::run, this);
+    for (size_t i = 0; i < worker_count_; ++i) {
+        workers_.emplace_back(&UbsMemoryTransport::run, this);
+    }
     return 0;
 }
 
@@ -180,39 +203,56 @@ bool UbsMemoryTransport::prepare(const TransferRequest& request, Work& work) {
 Status UbsMemoryTransport::submitTransferTask(
     const std::vector<TransferTask*>& tasks) {
     for (auto* task : tasks) {
-        auto* slice = getSliceCache().allocate();
         const auto& request = *task->request;
-        slice->source_addr = request.source;
-        slice->length = request.length;
-        slice->opcode = request.opcode;
-        slice->target_id = request.target_id;
-        slice->task = task;
-        slice->status = Slice::PENDING;
         task->total_bytes = request.length;
-        task->slice_list.push_back(slice);
-        __atomic_store_n(&task->slice_count, 1, __ATOMIC_RELEASE);
-        Work work{slice, nullptr, nullptr, 0,
-                  std::chrono::steady_clock::now() + timeout_};
-        bool queued = false;
+        Work target{nullptr, nullptr, nullptr, 0,
+                    std::chrono::steady_clock::now() + timeout_};
+        std::unique_lock lock(mutex_);
+        bool prepared = false;
         try {
-            std::unique_lock lock(mutex_);
-            // A full queue applies backpressure until the request's deadline.
-            const bool has_space =
-                space_.wait_until(lock, work.deadline, [this] {
-                    return stopping_ || queue_.size() < kQueueCapacity;
-                });
-            if (has_space && !stopping_ && prepare(request, work)) {
-                queue_.push_back(std::move(work));
-                queued = true;
-            }
+            prepared = !stopping_ && prepare(request, target);
         } catch (const std::exception& error) {
             LOG(ERROR) << "UBS transfer preparation failed: " << error.what();
         }
-        if (queued) {
+        // Chunks end at multiples of the chunk size within the object, so
+        // chunks of one request never share a page. A request that cannot
+        // be prepared gets one slice that fails.
+        std::vector<Work> chunks;
+        size_t done = 0;
+        do {
+            size_t length = request.length - done;
+            if (prepared) {
+                const size_t offset = target.offset + done;
+                length = std::min(length, chunk_size_ - offset % chunk_size_);
+            }
+            auto* slice = getSliceCache().allocate();
+            slice->source_addr = static_cast<char*>(request.source) + done;
+            slice->length = length;
+            slice->opcode = request.opcode;
+            slice->target_id = request.target_id;
+            slice->task = task;
+            slice->status = Slice::PENDING;
+            task->slice_list.push_back(slice);
+            Work chunk = target;
+            chunk.slice = slice;
+            chunk.offset = target.offset + done;
+            chunks.push_back(std::move(chunk));
+            done += length;
+        } while (prepared && done < request.length);
+        // Publish the count before any chunk can complete.
+        __atomic_store_n(&task->slice_count, chunks.size(), __ATOMIC_RELEASE);
+        size_t queued = 0;
+        while (prepared && queued < chunks.size()) {
+            // A full queue applies backpressure until the request's deadline.
+            const bool has_space = space_.wait_until(
+                lock, target.deadline,
+                [this] { return stopping_ || queue_.size() < kQueueCapacity; });
+            if (!has_space || stopping_) break;
+            queue_.push_back(std::move(chunks[queued++]));
             ready_.notify_one();
-        } else {
-            std::lock_guard lock(mutex_);
-            slice->markFailed();
+        }
+        for (size_t i = queued; i < chunks.size(); ++i) {
+            chunks[i].slice->markFailed();
         }
     }
     return Status::OK();

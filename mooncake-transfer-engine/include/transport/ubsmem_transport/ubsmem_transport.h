@@ -5,6 +5,7 @@
 #include <map>
 #include <set>
 #include <thread>
+#include <vector>
 
 #include "transport/transport.h"
 #include "transport/ubsmem_transport/ubsmem_memory.h"
@@ -57,9 +58,13 @@ class UbsMemoryTransport final : public Transport {
     std::map<std::string, std::shared_ptr<UbsMemoryArena>> imports_;
     std::deque<Work> queue_;
     std::set<BatchID> uncertain_batches_;
-    std::thread worker_;
+    std::vector<std::thread> workers_;
     bool stopping_ = false;
+    // MC_UBSMEM_TIMEOUT_MS, MC_UBSMEM_CHUNK_SIZE and MC_UBSMEM_WORKERS.
     std::chrono::milliseconds timeout_{30000};
+    size_t chunk_size_ = 64 * 1024 * 1024;
+    size_t worker_count_ = 4;
+    // Queued chunks, not requests.
     static constexpr size_t kQueueCapacity = 256;
 };
 }  // namespace mooncake

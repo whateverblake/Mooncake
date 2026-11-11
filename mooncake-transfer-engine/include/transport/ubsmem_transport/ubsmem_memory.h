@@ -1,12 +1,15 @@
 #pragma once
 
-#include <chrono>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "transport/ubsmem_transport/ubsmem_descriptor.h"
 
@@ -15,7 +18,9 @@ namespace mooncake {
 // A mapping is private to this process. In "cache" access mode its pointer is
 // only an address token outside copy(): pages have no access between copies,
 // so the CPU cannot cache them. The master keeps clients apart; copy() takes
-// no cross-process lock, only the page range it touches.
+// no cross-process lock, only the page range it touches. Copies on disjoint
+// page ranges run concurrently; overlapping ones in this process wait, since
+// releasing a range revokes access to its pages.
 class UbsMemoryArena : public std::enable_shared_from_this<UbsMemoryArena> {
    public:
     using Deadline = std::chrono::steady_clock::time_point;
@@ -58,8 +63,13 @@ class UbsMemoryArena : public std::enable_shared_from_this<UbsMemoryArena> {
     bool owner_;
 
    private:
-    std::timed_mutex mutex_;
-    bool failed_ = false;
+    bool busy(size_t offset, size_t length) const;
+
+    std::mutex mutex_;
+    std::condition_variable idle_;
+    // Page ranges [offset, offset + length) with a copy in progress.
+    std::vector<std::pair<size_t, size_t>> active_;
+    std::atomic_bool failed_{false};
     std::atomic_bool store_claimed_{false};
 };
 

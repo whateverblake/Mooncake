@@ -120,15 +120,17 @@ bool UbsMemoryArena::overlaps(const void* addr, size_t size) {
     return false;
 }
 
+bool UbsMemoryArena::busy(size_t offset, size_t length) const {
+    return std::any_of(active_.begin(), active_.end(), [&](const auto& range) {
+        return offset < range.first + range.second &&
+               range.first < offset + length;
+    });
+}
+
 bool UbsMemoryArena::copy(size_t offset, void* buffer, size_t length,
                           bool write, Deadline deadline) {
     if (!buffer || !length || offset >= size() || length > size() - offset ||
         overlaps(buffer, length)) {
-        return false;
-    }
-    std::unique_lock lock(mutex_, std::defer_lock);
-    if (!lock.try_lock_until(deadline) || failed_ || !base_ ||
-        std::chrono::steady_clock::now() >= deadline) {
         return false;
     }
     // Ownership changes work on whole pages. Allocations are page aligned,
@@ -137,6 +139,29 @@ bool UbsMemoryArena::copy(size_t offset, void* buffer, size_t length,
     const size_t first = offset / page * page;
     const size_t span =
         std::min(size(), (offset + length + page - 1) / page * page) - first;
+    {
+        std::unique_lock lock(mutex_);
+        if (!idle_.wait_until(
+                lock, deadline,
+                [&] { return failed_ || !base_ || !busy(first, span); }) ||
+            failed_ || !base_ || std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        active_.emplace_back(first, span);
+    }
+    // Active ranges never overlap, so the entry is unique.
+    struct Finish {
+        UbsMemoryArena& arena;
+        std::pair<size_t, size_t> range;
+        ~Finish() {
+            {
+                std::lock_guard lock(arena.mutex_);
+                auto& active = arena.active_;
+                active.erase(std::find(active.begin(), active.end(), range));
+            }
+            arena.idle_.notify_all();
+        }
+    } finish{*this, {first, span}};
     try {
         if (!acquire(first, span, write, deadline)) return false;
         auto* target = static_cast<char*>(base_) + offset;
@@ -159,7 +184,8 @@ bool UbsMemoryArena::copy(size_t offset, void* buffer, size_t length,
 bool UbsMemoryArena::remove() {
     std::lock_guard registry_lock(registry_mutex);
     std::lock_guard lock(mutex_);
-    if (!owner_ || !base_ || failed_ || weak_from_this().use_count() != 1) {
+    if (!owner_ || !base_ || failed_ || !active_.empty() ||
+        weak_from_this().use_count() != 1) {
         return false;
     }
     return removeBacking();

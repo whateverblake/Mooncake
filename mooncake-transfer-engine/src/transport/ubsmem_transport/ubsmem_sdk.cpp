@@ -162,7 +162,8 @@ class SdkArena final : public UbsMemoryArena {
     }
 
     std::shared_ptr<SdkContext> context_;
-    bool failed_ = false;
+    // Workers copy disjoint ranges concurrently and may all report failure.
+    std::atomic_bool failed_{false};
 };
 }  // namespace
 

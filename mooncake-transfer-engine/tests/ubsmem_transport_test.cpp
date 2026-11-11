@@ -3,6 +3,7 @@
 
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 
 #include <array>
 #include <cstdlib>
@@ -11,6 +12,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 namespace {
 void require(bool result, const char* message) {
@@ -105,6 +107,9 @@ int main(int argc, char** argv) {
         require(mkdtemp(directory), "directory");
         setenv("MC_UBSMEM_MOCK_DIR", directory, 1);
         setenv("MC_UBSMEM_TIMEOUT_MS", "200", 1);
+        const auto page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+        const size_t chunk = 8 * page;
+        setenv("MC_UBSMEM_CHUNK_SIZE", std::to_string(chunk).c_str(), 1);
         auto arena = mooncake::UbsMemoryArena::create(4 * 1024 * 1024);
         if (argc == 4) {
             mooncake::TransferEngine engine;
@@ -190,6 +195,76 @@ int main(int argc, char** argv) {
                 reinterpret_cast<uintptr_t>(arena->base()) + arena->size() - 1;
             require(transfer(client, request).s == mooncake::Transport::FAILED,
                     "cross-boundary request fails");
+
+            // A large request splits into page-aligned chunks.
+            std::vector<unsigned char> payload(64 * page + 100);
+            for (size_t i = 0; i < payload.size(); ++i) {
+                payload[i] = static_cast<unsigned char>(i * 7 + 3);
+            }
+            require(client.registerLocalMemory(payload.data(), payload.size(),
+                                               "cpu:0", false) == 0,
+                    "register large staging memory");
+            auto big = request;
+            big.opcode = mooncake::TransferRequest::WRITE;
+            big.source = payload.data();
+            big.length = payload.size();
+            big.target_offset = reinterpret_cast<uintptr_t>(arena->base()) + 37;
+            status = transfer(client, big);
+            require(status.s == mooncake::Transport::COMPLETED &&
+                        status.transferred_bytes == payload.size(),
+                    "chunked WRITE completed with exact byte count");
+            std::fill(payload.begin(), payload.end(), 0);
+            big.opcode = mooncake::TransferRequest::READ;
+            require(transfer(client, big).s == mooncake::Transport::COMPLETED,
+                    "chunked READ completed");
+            for (size_t i = 0; i < payload.size(); ++i) {
+                require(payload[i] == static_cast<unsigned char>(i * 7 + 3),
+                        "chunked payload");
+            }
+
+            // Stall the first chunk's pages, as a peer stalled mid-copy
+            // would. Workers still copy the other chunks before it times out.
+            const auto object =
+                std::string(directory) + "/" + arena->descriptor().object_name;
+            const int stall = open(object.c_str(), O_RDWR | O_CLOEXEC);
+            struct stat file{};
+            require(stall >= 0 && fstat(stall, &file) == 0, "open stall");
+            struct flock first{};
+            first.l_type = F_WRLCK;
+            first.l_whence = SEEK_SET;
+            first.l_start = file.st_size - static_cast<off_t>(arena->size());
+            first.l_len = static_cast<off_t>(page);
+            require(fcntl(stall, F_OFD_SETLK, &first) == 0, "stall chunk");
+            big.opcode = mooncake::TransferRequest::WRITE;
+            // Tasks keep a pointer to their request.
+            const std::vector<mooncake::TransferRequest> pending{big};
+            auto stalled = client.allocateBatchID(1);
+            require(client.submitTransfer(stalled, pending).ok(),
+                    "submit stalled request");
+            const size_t chunks = (37 + payload.size() + chunk - 1) / chunk;
+            auto& task = mooncake::Transport::toBatchDesc(stalled).task_list[0];
+            require(
+                __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE) == chunks,
+                "one slice per chunk");
+            mooncake::TransferStatus partial{};
+            const auto settle =
+                std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            do {
+                require(client.getTransferStatus(stalled, 0, partial).ok(),
+                        "stalled poll");
+                require(std::chrono::steady_clock::now() < settle,
+                        "stalled request did not finish");
+            } while (partial.s == mooncake::Transport::PENDING);
+            require(
+                partial.s == mooncake::Transport::FAILED &&
+                    __atomic_load_n(&task.success_slice_count,
+                                    __ATOMIC_ACQUIRE) == chunks - 1 &&
+                    partial.transferred_bytes == payload.size() - (chunk - 37),
+                "only the stalled chunk fails");
+            require(client.freeBatchID(stalled).ok(), "free stalled batch");
+            close(stall);
+            require(client.unregisterLocalMemory(payload.data()) == 0,
+                    "unregister large staging memory");
 
             // A separate open-file description holds the mock's range check
             // over the object, as a peer stalled mid-copy would.

@@ -113,3 +113,26 @@ services:
 volumes:
   build:
 ```
+
+## UBS Memory Transport (`ubsmem`) Copy Threads
+
+- Protocol `ubsmem` copies payloads with CPU `memcpy` through UBS Memory
+  shared mappings. Full guide: `mooncake-transfer-engine/README_UBSMEM.md`.
+- `MC_UBSMEM_WORKERS` sets the number of copy threads per process (1 to 64,
+  default 4). `MC_UBSMEM_CHUNK_SIZE` sets the bytes per chunk (a multiple of
+  the page size, default 64 MiB). Each request splits at multiples of the chunk
+  size within the UBS object, so chunks never share a page.
+- Set both in the environment of every copying process before it starts: the
+  producer, the consumer, and the provider when it runs Put or Get on its own
+  pool. The transport reads them only once, in the `UbsMemoryTransport`
+  constructor. Invalid values make transport creation fail.
+- One request uses at most one thread per chunk. Many requests in a batch use
+  all threads. Lower the chunk size to split medium objects; each chunk costs
+  one ownership acquire/release pair in `cache` mode.
+- Use `MC_UBSMEM_WORKERS=1` for single-copy debugging, or if concurrent
+  `ubsmem_shmem_set_ownership` calls prove unsafe on hardware.
+- Copies on disjoint pages of a pool run in parallel. Copies that overlap
+  within one process wait for each other in `UbsMemoryArena::copy`, because a
+  release revokes access to its pages. Do not remove this exclusion.
+- Speed and the best values are unmeasured. The mock cannot show UB
+  bandwidth; tune on a UB host.

@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <filesystem>
@@ -15,6 +16,7 @@
 #include <limits>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 using mooncake::UbsMemoryArena;
 using mooncake::UbsMemoryDescriptor;
@@ -191,6 +193,25 @@ int main(int argc, char** argv) {
                 "other ranges remain readable");
         close(peer);
         require(arena->copy(0, &value, 1, true, soon()), "range released");
+
+        // Overlapping copies in one process wait for each other: releasing
+        // one copy's pages must not revoke them under another copy.
+        std::atomic_bool overlapping_ok{true};
+        std::vector<std::thread> copiers;
+        for (int t = 0; t < 4; ++t) {
+            copiers.emplace_back([&, t] {
+                std::vector<unsigned char> data(3 * page,
+                                                static_cast<unsigned char>(t));
+                for (int i = 0; i < 200 && overlapping_ok; ++i) {
+                    if (!arena->copy(page / 2 + t, data.data(), data.size(),
+                                     i % 2 == 0)) {
+                        overlapping_ok = false;
+                    }
+                }
+            });
+        }
+        for (auto& copier : copiers) copier.join();
+        require(overlapping_ok, "overlapping concurrent copies");
         require(arena->remove(), "remove quiescent arena");
         require(!arena->copy(0, &value, 1, true), "removed arena rejected");
         arena.reset();

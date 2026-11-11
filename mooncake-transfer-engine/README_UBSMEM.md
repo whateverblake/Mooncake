@@ -64,7 +64,7 @@ revoke path instead of publishing a readable replica. [Store client](../mooncake
    protocol to the classic Transfer Engine. With `ubsmem` selected,
    `TransferEngineImpl::init()` asks `MultiTransport` to construct and install
    one `UbsMemoryTransport`. Installation publishes the local segment
-   descriptor and starts the worker. After successful initialization,
+   descriptor and starts the copy workers. After successful initialization,
    `getTransport("ubsmem")` returns it. The engine rejects a conflicting
    `MC_FORCE_TCP` selection. [Engine initialization](src/transfer_engine_impl.cpp) · [Transport factory](src/multi_transport.cpp)
 2. **Allocate local staging.** Each client may create an ordinary CPU buffer.
@@ -121,15 +121,44 @@ access. [Guarded copy](src/transport/ubsmem_transport/ubsmem_memory.cpp)
 
 ## Transfer execution, deletion and reuse
 
-The submitting thread prepares work and enqueues it. One worker per transport
-acquires arena access, copies the slice and releases access before reporting
-success. Queue capacity is 256 pending requests. When the queue is full,
+The submitting thread prepares each request and splits it into chunks. Chunk
+boundaries are multiples of `MC_UBSMEM_CHUNK_SIZE` (default 64 MiB) within the
+object, so chunks never share a page. A pool of `MC_UBSMEM_WORKERS` threads
+(default 4) copies chunks concurrently. Each worker acquires access to its
+chunk's pages, copies, and releases access before reporting that slice. A
+request completes when all its chunks do; one failed chunk fails the request.
+Copies on disjoint pages of a pool run in parallel. Overlapping copies in one
+process wait for each other, because releasing a range revokes access to its
+pages. Queue capacity is 256 pending chunks. When the queue is full,
 submission waits for space instead of failing, so a large Store batch is
 throttled rather than rejected. The default request deadline is 30 seconds;
 a request that cannot enter the queue before its deadline fails. Staging
 memory must live through completion. Store disables its ordinary local memcpy
 shortcut for UBSMEM, including B's Put/Get against its own pool.
 Self-targeted transfers use the same cache steps as remote ones.
+
+**Copy threads.** Set `MC_UBSMEM_WORKERS` (1 to 64, default 4) and
+`MC_UBSMEM_CHUNK_SIZE` (bytes, a multiple of the page size, default 64 MiB)
+in the environment of each process that copies data. That is producer A,
+consumer C, and provider B when B runs Put or Get on its own pool.
+
+- Each process has its own pool of copy threads.
+- The transport reads both values once, when it is created. Set them before the
+  process starts. Changing them later has no effect.
+- An invalid value stops the transport from starting, so engine
+  initialization fails. The transport does not fall back to the default.
+- One request uses at most one thread per chunk. A 256 MiB object makes four
+  64 MiB chunks, so more than four threads do not speed up that one request.
+  A batch of many requests spreads across all threads.
+- To split medium objects across threads, lower the chunk size, for example
+  `MC_UBSMEM_CHUNK_SIZE=$((16*1024*1024))`. Each chunk adds one ownership
+  acquire and release in `cache` mode, so very small chunks cost more calls.
+- Use `MC_UBSMEM_WORKERS=1` to step through `UbsMemoryArena::copy` in a
+  debugger with only one copy running.
+- The best values depend on the UB hardware and have not been measured. On a
+  UB host, compare 1, 2, 4, 8 and 16 threads. If concurrent
+  `ubsmem_shmem_set_ownership` calls prove unsafe, `MC_UBSMEM_WORKERS=1`
+  restores the old one-thread behavior.
 
 **No cross-process lock.** The master keeps clients apart: each Put gets its
 own range, a key is visible only after its Put completes, and the master
@@ -302,6 +331,8 @@ The working provider configuration uses the direct `RealClient` path.
 | `MC_TE_HANDSHAKE_PORT` | Set separately for B, A and C as shown above. UBS uses shared memory for payloads and opens no TCP data listener. |
 | `MC_RPC_TIMEOUT_MS=-1` and `MC_RPC_CONNECT_TIMEOUT_MS=3600000000` | Disable the per-request master RPC timer and allow an extended connection timeout during stepping. |
 | `MC_UBSMEM_TIMEOUT_MS=3600000` | Set the worker's queue and access deadline to one hour, the maximum supported value. |
+| `MC_UBSMEM_WORKERS=1` | Copy one chunk at a time, so a breakpoint in `UbsMemoryArena::copy` stops a single worker. Default 4, maximum 64. |
+| `MC_UBSMEM_CHUNK_SIZE` | Bytes per copy chunk, a multiple of the page size. Default 64 MiB. Larger values reduce ownership calls; smaller values split medium objects across workers. |
 | `GLOG_v=2`, `GLOG_logtostderr=1`, `MC_YLT_LOG_LEVEL=debug`, `MC_LOG_LEVEL=TRACE` | Show verbose Store, RPC and engine output in each client's Debug Console. The master uses `--v=2 --logtostderr --log_dir=/tmp` and `MC_YLT_LOG_LEVEL=debug`. |
 
 For a terminal master launch, run the following inside the container.
@@ -321,7 +352,8 @@ eviction for UBS pools.
 
 
 - `TransferEngineImpl::init`: selects the UBS transport before returning to the Store client.
-- `UbsMemoryTransport::install`: publishes the local segment and starts the worker.
+- `UbsMemoryTransport::install`: publishes the local segment and starts the copy workers.
+- `UbsMemoryTransport::submitTransferTask`: splits a request into page-aligned chunks.
 - `UbsMemoryArena::create`: allocation and whole-object mapping.
 - `MasterService::BeginUbsMemoryTransfer`: validate and hold an allocation.
 - `MasterService::EndUbsMemoryTransfer`: release a completed transfer reference.
@@ -391,7 +423,7 @@ arena for a new session.
 
 | Test area | What the tests verify |
 | --- | --- |
-| Arena and Transfer Engine | Named mapping and descriptor validation, self-targeted and imported READ/WRITE, range checks, a stalled range that does not block other ranges of the pool, both access modes, queue deadlines, a 600-request batch that waits for queue space, and metadata publication failures. |
+| Arena and Transfer Engine | Named mapping and descriptor validation, self-targeted and imported READ/WRITE, range checks, a stalled range that does not block other ranges of the pool, chunked requests whose other chunks finish while one chunk is stalled, overlapping concurrent copies in one process, both access modes, queue deadlines, a 600-request batch that waits for queue space, and metadata publication failures. |
 | Allocator and transfer references | Reuse in a small pool, merging adjacent free ranges, multiple pins, stale descriptors and replayed Begin/End operations. |
 | Store end to end | A real master and separate B/A/C processes in both access modes, successful Put/Get, configured segment name visible through the master, grouped transfers, full-pool reuse and refusal to reuse a range while pinned. |
 | Failure and compatibility | Injected ownership-release failure retains the affected reservation. Separate tests cover master policy rejection and TCP Store and Transfer Engine transfers. |
